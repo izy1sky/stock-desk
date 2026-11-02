@@ -1,0 +1,10 @@
+{
+  "name": "stock-desk",
+  "version": "0.1.0",
+  "description": "A stock pane: daily candlestick chart with highs, lows and trend, price-drop checks, news, and earnings and economic calendars",
+  "author": {
+    "name": "izy1sky"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

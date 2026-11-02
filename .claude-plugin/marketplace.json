@@ -1,0 +1,13 @@
+{
+  "name": "stock-desk",
+  "description": "A stock pane for Claude Code: candlestick charts, news, market calendar and portfolio checks",
+  "owner": {
+    "name": "izy1sky"
+  },
+  "plugins": [
+    {
+      "name": "stock-desk",
+      "source": "./"
+    }
+  ]
+}
