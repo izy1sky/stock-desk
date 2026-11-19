@@ -16,6 +16,8 @@ On top: key levels (swing points, averages, option walls), expected moves, bull/
 
 Claude gets the tools `analyze_ticker`, `market_overview`, `options_positioning`, `beta_map` ("SPX to 7500: where are SOXL and TQQQ?") and `probability` (odds of closing above or touching a level), and the `stock-desk:analyze` skill that says how to read them. The pane's Analysis tab shows the same report.
 
+**Languages**: English and 简体中文 — the Language button in the pane's footer switches every pane, the analysis included; the tools answer Claude in English either way.
+
 Data: Nasdaq (prices, ~15 min delayed), CBOE (options, VIX), CNBC (futures, cash indexes), CFTC (COT). No keys. This is analysis of market data, not investment advice.
 
 ## Pane

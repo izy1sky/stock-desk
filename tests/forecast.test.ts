@@ -1,7 +1,24 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Bar } from '../types'
+import { isText, type Text } from '../hooks/i18n'
 import { analogFeatures, analogs, expectedMoves, probAbove, probTouch, scenarios } from '../hooks/engine/forecast'
+
+/** Every Text pair inside a value, with where it sits. */
+function texts(x: unknown, path = '$', out: { path: string; t: Text }[] = []): { path: string; t: Text }[] {
+  if (Array.isArray(x)) x.forEach((v, i) => texts(v, `${path}[${i}]`, out))
+  else if (isText(x)) out.push({ path, t: x })
+  else if (x && typeof x === 'object') for (const [k, v] of Object.entries(x)) texts(v, `${path}.${k}`, out)
+
+  return out
+}
+
+/** Each non-empty Text has a Chinese side with at least one CJK character. */
+function expectTranslated(x: unknown) {
+  const all = texts(x)
+  expect(all.length).toBeGreaterThan(0)
+  expect(all.filter(({ t }) => t.en !== '' && !/[一-鿿]/.test(t.zh)).map(({ path, t }) => `${path}: ${t.zh}`)).toEqual([])
+}
 
 function noise(seed: number): () => number {
   let s = seed >>> 0
@@ -67,11 +84,16 @@ test('scenarios pick levels beyond half a sigma and keep the signal out of the o
   expect(bull!.target).toBe(104)
   expect(bear!.target).toBe(95)
   expect(base!.range).toEqual([95, 104])
-  expect(bull!.trigger).toMatch(/104/)
+  expect(bull!.trigger.en).toMatch(/104/)
+  expect(bull!.trigger.zh).toContain('104')
+  expect(bull!.invalidation.zh).toContain('收盘跌破 95')
+  expect(base!.trigger.zh).toBe('维持在 95.00 至 104.00 之间')
   expect(a.rows.map(r => r.probability)).toEqual(b.rows.map(r => r.probability))
   expect(a.compositeScore).toBe(60)
   expect(a.bias).toBe('bullish')
-  expect(a.note).toMatch(/not priced in/)
+  expect(a.note.en).toMatch(/not priced in/)
+  expect(a.note.zh).toContain('未计入概率')
+  expect(a.note.zh).toContain('看多')
   for (const r of a.rows) {
     expect(r.probability).toBeGreaterThan(0)
     expect(r.probability).toBeLessThanOrEqual(1)
@@ -85,7 +107,7 @@ test('scenarios pick levels beyond half a sigma and keep the signal out of the o
 test('analogs only use days whose forward window ends inside the data, spaced apart', () => {
   const bars = walk(900)
   const a = analogs(bars, { horizons: [5, 20], k: 30, minGap: 5 })
-  if (!a.ok) throw new Error(a.note)
+  if (!a.ok) throw new Error(a.note.en)
   expect(a.lastEligibleIndex).toBe(bars.length - 1 - 20)
   expect(a.horizons.map(h => h.days)).toEqual([5, 20])
   expect(a.horizons[0]!.analogs.n).toBe(30)
@@ -119,11 +141,28 @@ test('analog features never look ahead: a crash in the last 20 bars leaves earli
 test('analogs explain themselves on short history, and run fast on ten years', () => {
   const short = analogs(walk(300))
   expect(short.ok).toBe(false)
-  if (!short.ok) expect(short.note).toMatch(/400 sessions/)
+  if (!short.ok) expect(short.note.en).toMatch(/400 sessions/)
+  if (!short.ok) expect(short.note.zh).toContain('400 个交易日')
 
   const long = walk(2500, 9)
   const t0 = Date.now()
   const r = analogs(long)
   expect(Date.now() - t0).toBeLessThan(1500)
   expect(r.ok).toBe(true)
+})
+
+test('forecast text comes in both languages', () => {
+  const levels = { supports: [99.5, 95, 90], resistances: [100.4, 104, 110] }
+  expectTranslated(scenarios({ spot: 100, sigma: 0.25, days: 21, levels, compositeScore: 60 }))
+  expectTranslated(scenarios({ spot: 100, sigma: 0.25, days: 21, levels: { supports: [], resistances: [] }, compositeScore: -20 }))
+  const moves = expectedMoves(100, 0.2)
+  expectTranslated(moves)
+  expect(moves.map(m => m.label.en)).toEqual(['1 day', '1 week', '1 month'])
+  const ok = analogs(walk(900), { horizons: [5, 20], k: 30 })
+  expect(ok.ok).toBe(true)
+  expectTranslated(ok)
+  if (ok.ok) expect(ok.note.zh).toContain('相似样本')
+  expectTranslated(analogs(walk(300)))
+  expectTranslated(analogs(walk(900), { horizons: [] }))
+  expectTranslated(analogs(walk(500), { k: 400 }))
 })

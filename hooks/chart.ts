@@ -1,4 +1,6 @@
 import type { Analysis } from './analysis'
+import { shortDate as shortDay, tr } from './i18n'
+import type { Lang } from './i18n'
 import type { Bar, ColorMode } from '../types'
 
 export const MA_COLORS = { ma20: '#f59e0b', ma50: '#3b82f6', ma200: '#a855f7' } as const
@@ -30,8 +32,14 @@ export function candleChart(opts: {
   /** Pixels; left out, about 0.6 of the width. */
   height?: number
   colors: ColorMode
+  /** The language of the chart's words (default English). */
+  lang?: Lang
 }): string {
   const { bars, from, a, colors } = opts
+  const lang = opts.lang ?? 'en'
+  const t = (en: string, zh: string) => tr(lang, en, zh)
+  const monthName = (iso: string) => (lang === 'zh' ? `${Number(iso.slice(5, 7))}月` : MONTHS[Number(iso.slice(5, 7)) - 1])
+  const dayName = (iso: string) => (lang === 'zh' ? shortDay('zh', iso) : shortDate(iso))
   const shown = bars.slice(from)
   const n = shown.length
   const W = Math.round(opts.width)
@@ -74,14 +82,14 @@ export function candleChart(opts: {
   // Month (or week) ticks along the bottom.
   let lastLabelX = -100
   for (let i = 0; i < n; i++) {
-    const t = shown[i]!.t
+    const day = shown[i]!.t
     const prevT = i > 0 ? shown[i - 1]!.t : ''
-    const isNewMonth = t.slice(0, 7) !== prevT.slice(0, 7)
-    const isNewWeek = n <= 30 && i > 0 && new Date(`${t}T12:00:00Z`).getUTCDay() < new Date(`${prevT}T12:00:00Z`).getUTCDay()
+    const isNewMonth = day.slice(0, 7) !== prevT.slice(0, 7)
+    const isNewWeek = n <= 30 && i > 0 && new Date(`${day}T12:00:00Z`).getUTCDay() < new Date(`${prevT}T12:00:00Z`).getUTCDay()
     if (!(isNewMonth || isNewWeek) || x(i) - lastLabelX < 46) continue
     lastLabelX = x(i)
     parts.push(`<line x1="${x(i).toFixed(1)}" x2="${x(i).toFixed(1)}" y1="${padT}" y2="${H - padB}" stroke="${GRID}"/>`)
-    parts.push(`<text x="${x(i).toFixed(1)}" y="${H - 5}" text-anchor="middle" fill="${MUTED}">${isNewMonth && n > 30 ? MONTHS[Number(t.slice(5, 7)) - 1] : shortDate(t)}</text>`)
+    parts.push(`<text x="${x(i).toFixed(1)}" y="${H - 5}" text-anchor="middle" fill="${MUTED}">${isNewMonth && n > 30 ? monthName(day) : dayName(day)}</text>`)
   }
 
   // Support (dashed) and resistance (dotted) levels inside the visible price span.
@@ -91,8 +99,8 @@ export function candleChart(opts: {
     parts.push(`<line x1="${padL}" x2="${padL + plotW}" y1="${ly}" y2="${ly}" stroke="${color}" stroke-dasharray="${dash}" stroke-opacity="0.8"/>`)
     parts.push(`<text x="${padL + 2}" y="${ly}" dy="-3" fill="${color}" font-size="9">${esc(label)} ${fmt(p)}</text>`)
   }
-  a.supports.slice(0, 2).forEach((s, i) => level(s.price, `Support ${i + 1}`, '#0ea5e9', '5 3'))
-  a.resistances.slice(0, 1).forEach(r => level(r.price, 'Resistance', '#f97316', '2 3'))
+  a.supports.slice(0, 2).forEach((s, i) => level(s.price, t(`Support ${i + 1}`, `支撑 ${i + 1}`), '#0ea5e9', '5 3'))
+  a.resistances.slice(0, 1).forEach(r => level(r.price, t('Resistance', '阻力'), '#f97316', '2 3'))
 
   // Volume bars.
   shown.forEach((b, i) => {
@@ -116,7 +124,11 @@ export function candleChart(opts: {
     const color = b.c >= b.o ? up : down
     const prevClose = i > 0 ? shown[i - 1]!.c : from > 0 ? bars[from - 1]!.c : b.o
     const chg = ((b.c - prevClose) / prevClose) * 100
-    const tip = `${b.t}  O ${fmt(b.o)}  H ${fmt(b.h)}  L ${fmt(b.l)}  C ${fmt(b.c)}  ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%  Vol ${vol(b.v)}`
+    const sign = `${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`
+    const tip = t(
+      `${b.t}  O ${fmt(b.o)}  H ${fmt(b.h)}  L ${fmt(b.l)}  C ${fmt(b.c)}  ${sign}  Vol ${vol(b.v)}`,
+      `${b.t}  开 ${fmt(b.o)}  高 ${fmt(b.h)}  低 ${fmt(b.l)}  收 ${fmt(b.c)}  ${sign}  量 ${vol(b.v)}`,
+    )
     const top = y(Math.max(b.o, b.c))
     const bodyH = Math.max(1, Math.abs(y(b.o) - y(b.c)))
     parts.push(
@@ -135,7 +147,7 @@ export function candleChart(opts: {
     const py = y(price)
     const anchor = px > padL + plotW * 0.8 ? 'end' : px < padL + plotW * 0.2 ? 'start' : 'middle'
     const ty = kind === 'high' ? py - 6 : py + 13
-    const label = `${kind === 'high' ? 'High' : 'Low'} ${fmt(price)} · ${shortDate(bars[index]!.t)}`
+    const label = `${kind === 'high' ? t('High', '最高') : t('Low', '最低')} ${fmt(price)} · ${dayName(bars[index]!.t)}`
     parts.push(`<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="2.5" fill="none" stroke="currentColor" stroke-width="1"/>`)
     parts.push(`<text x="${px.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="${anchor}" font-weight="600" fill="${kind === 'high' ? up : down}">${esc(label)}</text>`)
   }
@@ -161,7 +173,7 @@ export function candleChart(opts: {
     parts.push(`<rect x="${lx}" y="6" width="10" height="2.5" fill="${color}"/><text x="${lx + 13}" y="10" fill="${MUTED}">${label}</text>`)
     lx += 52
   }
-  parts.push(`<text x="${W - padR}" y="10" text-anchor="end" fill="${MUTED}">Daily · ${n} sessions</text>`)
+  parts.push(`<text x="${W - padR}" y="10" text-anchor="end" fill="${MUTED}">${t(`Daily · ${n} sessions`, `日线 · ${n} 个交易日`)}</text>`)
 
   parts.push('</svg>')
 

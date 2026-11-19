@@ -6,7 +6,8 @@
 import { sma } from '../analysis'
 import { normCdf, quantile, realizedVolSeries, rsiSeries, TRADING_DAYS } from './indicators'
 import { fmtPrice } from './technicals'
-import { biasOf, type Bar, type Bias, type Levels } from './types'
+import { bi, biasText } from '../i18n'
+import { biasOf, type Bar, type Bias, type Levels, type Text } from './types'
 
 const fin = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n)
 
@@ -40,7 +41,7 @@ export function probTouch(spot: number, level: number, sigma: number, days: numb
 
 export type ExpectedMove = {
   days: number
-  label: string
+  label: Text
   /** 1σ move in % (σ√T × 100). */
   pct1: number
   /** Lognormal bands: spot × exp(∓kσ√T). */
@@ -52,16 +53,18 @@ export type ExpectedMove = {
 
 /** ±1σ and ±2σ price bands for 1 day, 1 week (5 days) and 1 month (21 days). */
 export function expectedMoves(spot: number, sigma: number): ExpectedMove[] {
-  return [
-    [1, '1 day'],
-    [5, '1 week'],
-    [21, '1 month'],
-  ].map(([days, label]) => {
-    const s = spread(sigma, days as number)
+  return (
+    [
+      [1, bi('1 day', '1 日')],
+      [5, bi('1 week', '1 周')],
+      [21, bi('1 month', '1 个月')],
+    ] as const
+  ).map(([days, label]) => {
+    const s = spread(sigma, days)
 
     return {
-      days: days as number,
-      label: label as string,
+      days,
+      label,
       pct1: s * 100,
       lower1: spot * Math.exp(-s),
       upper1: spot * Math.exp(s),
@@ -84,8 +87,8 @@ export type Scenario = {
   probKind: 'touch' | 'finish inside'
   /** Where the target came from. */
   source: 'level' | '1 sigma'
-  trigger: string
-  invalidation: string
+  trigger: Text
+  invalidation: Text
 }
 
 export type Scenarios = {
@@ -96,7 +99,7 @@ export type Scenarios = {
   /** The composite directional signal, passed through untouched. */
   compositeScore: number
   bias: Bias
-  note: string
+  note: Text
 }
 
 /**
@@ -121,8 +124,8 @@ export function scenarios(input: { spot: number; sigma: number; days: number; le
   const f = fmtPrice
 
   // Trigger: the first meaningful level in the way of the target; invalidation: the first on the other side.
-  const bullTrigger = r1 !== undefined && r1 < bull ? `close above ${f(r1)}` : `push through ${f(bull)}`
-  const bearTrigger = s1 !== undefined && s1 > bear ? `close below ${f(s1)}` : `break down to ${f(bear)}`
+  const bullTrigger = r1 !== undefined && r1 < bull ? bi(`close above ${f(r1)}`, `收盘站上 ${f(r1)}`) : bi(`push through ${f(bull)}`, `向上突破 ${f(bull)}`)
+  const bearTrigger = s1 !== undefined && s1 > bear ? bi(`close below ${f(s1)}`, `收盘跌破 ${f(s1)}`) : bi(`break down to ${f(bear)}`, `下探至 ${f(bear)}`)
   const bullStop = s1 !== undefined && s1 > bear ? s1 : bear
   const bearStop = r1 !== undefined && r1 < bull ? r1 : bull
 
@@ -135,7 +138,7 @@ export function scenarios(input: { spot: number; sigma: number; days: number; le
       probKind: 'touch',
       source: bullLevel !== undefined ? 'level' : '1 sigma',
       trigger: bullTrigger,
-      invalidation: `close below ${f(bullStop)}`,
+      invalidation: bi(`close below ${f(bullStop)}`, `收盘跌破 ${f(bullStop)}`),
     },
     {
       name: 'base',
@@ -144,8 +147,8 @@ export function scenarios(input: { spot: number; sigma: number; days: number; le
       probability: Math.max(0, probAbove(spot, bear, sigma, days) - probAbove(spot, bull, sigma, days)),
       probKind: 'finish inside',
       source: bullLevel !== undefined || bearLevel !== undefined ? 'level' : '1 sigma',
-      trigger: `holds between ${f(bear)} and ${f(bull)}`,
-      invalidation: `close outside ${f(bear)} – ${f(bull)}`,
+      trigger: bi(`holds between ${f(bear)} and ${f(bull)}`, `维持在 ${f(bear)} 至 ${f(bull)} 之间`),
+      invalidation: bi(`close outside ${f(bear)} – ${f(bull)}`, `收盘脱离 ${f(bear)} – ${f(bull)} 区间`),
     },
     {
       name: 'bear',
@@ -155,13 +158,17 @@ export function scenarios(input: { spot: number; sigma: number; days: number; le
       probKind: 'touch',
       source: bearLevel !== undefined ? 'level' : '1 sigma',
       trigger: bearTrigger,
-      invalidation: `close above ${f(bearStop)}`,
+      invalidation: bi(`close above ${f(bearStop)}`, `收盘站上 ${f(bearStop)}`),
     },
   ]
   const bias = biasOf(compositeScore)
-  const note =
+  const sig = `${compositeScore >= 0 ? '+' : ''}${Math.round(compositeScore)}`
+  const note = bi(
     `Odds are a zero-drift lognormal model at σ ${(sigma * 100).toFixed(1)}% over ${days} sessions; bull/bear are touch odds, base is the odds of finishing inside, so they overlap. ` +
-    `The signal (${compositeScore >= 0 ? '+' : ''}${Math.round(compositeScore)}, ${bias}) is not priced in.`
+      `The signal (${sig}, ${bias}) is not priced in.`,
+    `概率来自零漂移对数正态模型（σ ${(sigma * 100).toFixed(1)}%，${days} 个交易日）；乐观/悲观为触及概率，基准为收于区间内的概率，三者有重叠。` +
+      `方向信号（${sig}，${biasText(bias).zh}）未计入概率。`,
+  )
 
   return { spot, sigma, days, rows, compositeScore, bias, note }
 }
@@ -292,9 +299,9 @@ export type AnalogStudy =
       closest: AnalogDate[]
       /** Today's raw feature values. */
       today: Record<AnalogFeature, number>
-      note: string
+      note: Text
     }
-  | { ok: false; note: string }
+  | { ok: false; note: Text }
 
 function forwardStats(rets: number[]): ForwardStats {
   const s = [...rets].sort((a, b) => a - b)
@@ -322,13 +329,13 @@ export function analogs(bars: Bar[], opts?: { horizons?: number[]; k?: number; m
   const horizons = [...new Set((opts?.horizons ?? [5, 20]).filter(h => Number.isInteger(h) && h > 0))].sort((a, b) => a - b)
   const k = Math.max(1, Math.floor(opts?.k ?? 40))
   const minGap = Math.max(1, Math.floor(opts?.minGap ?? 5))
-  if (bars.length < 400) return { ok: false, note: `Analogs need about 400 sessions of history; have ${bars.length}.` }
-  if (!horizons.length) return { ok: false, note: 'No valid horizons.' }
+  if (bars.length < 400) return { ok: false, note: bi(`Analogs need about 400 sessions of history; have ${bars.length}.`, `历史相似样本需要约 400 个交易日的历史，当前只有 ${bars.length} 个。`) }
+  if (!horizons.length) return { ok: false, note: bi('No valid horizons.', '没有有效的周期。') }
   const maxH = horizons[horizons.length - 1]!
   const feats = analogFeatures(bars)
   const lastIdx = bars.length - 1
   const today = feats[lastIdx]
-  if (!today) return { ok: false, note: 'Not enough history to compute today’s features.' }
+  if (!today) return { ok: false, note: bi('Not enough history to compute today’s features.', '历史数据不足，无法计算今日特征。') }
 
   // z-score each feature over all days that have it
   const dim = ANALOG_FEATURES.length
@@ -359,7 +366,10 @@ export function analogs(bars: Bar[], opts?: { horizons?: number[]; k?: number; m
     cands.push({ i, dist: Math.sqrt(s) })
   }
   if (cands.length < k * 2)
-    return { ok: false, note: `Only ${cands.length} eligible past days; need at least ${k * 2} for ${k} analogs.` }
+    return {
+      ok: false,
+      note: bi(`Only ${cands.length} eligible past days; need at least ${k * 2} for ${k} analogs.`, `仅有 ${cands.length} 个可用历史交易日；取 ${k} 个相似样本至少需要 ${k * 2} 个。`),
+    }
   cands.sort((a, b) => a.dist - b.dist)
   const picked: { i: number; dist: number }[] = []
   for (const c of cands) {
@@ -383,10 +393,16 @@ export function analogs(bars: Bar[], opts?: { horizons?: number[]; k?: number; m
   const todayRec = Object.fromEntries(ANALOG_FEATURES.map((name, d) => [name, today[d]!])) as Record<AnalogFeature, number>
   const h0 = horizonRows[horizonRows.length - 1]!
   const edge = h0.analogs.mean - h0.baseline.mean
-  const note =
-    `${picked.length} analogs from ${cands.length} eligible days since ${bars[cands.reduce((m, c) => Math.min(m, c.i), lastIdx)]!.t}. ` +
-    `${h0.days}-day mean ${h0.analogs.mean >= 0 ? '+' : ''}${h0.analogs.mean.toFixed(2)}% vs baseline ${h0.baseline.mean >= 0 ? '+' : ''}${h0.baseline.mean.toFixed(2)}% ` +
-    `(${edge >= 0 ? '+' : ''}${edge.toFixed(2)} pts). Analog samples overlap and are small: treat as context, not a forecast.`
+  const since = bars[cands.reduce((m, c) => Math.min(m, c.i), lastIdx)]!.t
+  const sgn = (x: number) => `${x >= 0 ? '+' : ''}${x.toFixed(2)}`
+  const note = bi(
+    `${picked.length} analogs from ${cands.length} eligible days since ${since}. ` +
+      `${h0.days}-day mean ${sgn(h0.analogs.mean)}% vs baseline ${sgn(h0.baseline.mean)}% ` +
+      `(${sgn(edge)} pts). Analog samples overlap and are small: treat as context, not a forecast.`,
+    `自 ${since} 起的 ${cands.length} 个可用交易日中选出 ${picked.length} 个相似样本。` +
+      `${h0.days} 日平均收益 ${sgn(h0.analogs.mean)}%，基准（全部交易日）${sgn(h0.baseline.mean)}%` +
+      `（差 ${sgn(edge)} 个百分点）。相似样本彼此重叠且数量少：仅作参考，不是预测。`,
+  )
 
   return {
     ok: true,

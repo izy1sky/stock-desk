@@ -1,4 +1,7 @@
 import type { Analysis } from './analysis'
+import { tr } from './i18n'
+import type { Lang } from './i18n'
+import { levelHead, statHead } from './levels'
 import type { Row } from './levels'
 import type { Bar, TickerData } from '../types'
 
@@ -18,8 +21,10 @@ function explainedTable(head: string[], rows: Row[]): string {
 }
 
 /** A standalone page for the browser: the chart at full width, levels and recent sessions. */
-export function chartPage(input: { data: TickerData; a: Analysis; svg: string; levels: Row[]; stats: Row[]; range: string }): string {
+export function chartPage(input: { data: TickerData; a: Analysis; svg: string; levels: Row[]; stats: Row[]; range: string; lang?: Lang }): string {
   const { data, a, svg } = input
+  const lang = input.lang ?? 'en'
+  const t = (en: string, zh: string) => tr(lang, en, zh)
   const q = data.quote
   const recent: Bar[] = data.bars.slice(-31)
   const sessions = recent
@@ -31,8 +36,8 @@ export function chartPage(input: { data: TickerData; a: Analysis; svg: string; l
     })
     .reverse()
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(data.symbol)} chart</title>
+  return `<!doctype html><html lang="${t('en', 'zh-CN')}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(data.symbol)} ${t('chart', '图表')}</title>
 <style>
 :root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--muted:#6b7280;--line:#e5e7eb}
 @media (prefers-color-scheme:dark){:root{--bg:#111316;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2a2e33}}
@@ -46,13 +51,16 @@ th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);verti
 li{margin:4px 0}.tip{text-decoration:underline dotted;text-underline-offset:3px;cursor:help}
 </style></head><body><main>
 <h1>${esc(data.name)} <span class="muted">${esc(data.symbol)}</span></h1>
-${q ? `<div class="price">$${q.price.toFixed(2)} <span style="font-size:18px">${q.change >= 0 ? '+' : ''}${q.change.toFixed(2)} (${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}%)</span></div><div class="muted">${esc(q.asOf)} · ${esc(q.marketStatus)} · 15-min delayed · ${esc(a.trend.label)}: ${esc(a.trend.detail)}</div>` : ''}
+${q ? `<div class="price">$${q.price.toFixed(2)} <span style="font-size:18px">${q.change >= 0 ? '+' : ''}${q.change.toFixed(2)} (${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}%)</span></div><div class="muted">${esc(q.asOf)} · ${esc(q.marketStatus)} · ${t('15-min delayed', '延迟 15 分钟')} · ${esc(a.trend.label)}${t(': ', '：')}${esc(a.trend.detail)}</div>` : ''}
 ${svg}
-<p class="muted">Daily candles over ${esc(input.range)}. Hover a candle for its open, high, low, close and volume. Orange MA20, blue MA50, purple MA200; dashed lines are support and resistance. Use your browser's zoom (⌘ +) or full screen (⌃⌘F) to look closer.</p>
-<h2>Price-drop check</h2><ul>${a.insights.map(i => `<li>${esc(i.text)}</li>`).join('')}</ul>
-<h2>Key levels <span class="muted" style="font-size:13px;font-weight:400">· hover an underlined name for what it means</span></h2>${explainedTable(['Level', 'Price', 'vs. now'], input.levels)}
-<h2>Indicators</h2>${explainedTable(['Measure', 'Value', 'Reading'], input.stats)}
-<h2>Last 30 sessions</h2>${table(['Date', 'Open', 'High', 'Low', 'Close', 'Change', 'Volume'], sessions)}
-<p class="muted">Data: Nasdaq. Signals come from price history only; this is not investment advice.</p>
+<p class="muted">${t(
+       `Daily candles over ${esc(input.range)}. Hover a candle for its open, high, low, close and volume. Orange MA20, blue MA50, purple MA200; dashed lines are support and resistance. Use your browser's zoom (⌘ +) or full screen (⌃⌘F) to look closer.`,
+       `${esc(input.range)} 日 K 线。把鼠标停在一根 K 线上，可查看开盘、最高、最低、收盘和成交量。橙色为 MA20，蓝色为 MA50，紫色为 MA200；虚线为支撑和阻力。可用浏览器缩放（⌘ +）或全屏（⌃⌘F）细看。`,
+     )}</p>
+<h2>${t('Price-drop check', '下跌检查')}</h2><ul>${a.insights.map(i => `<li>${esc(i.text)}</li>`).join('')}</ul>
+<h2>${t('Key levels', '关键价位')} <span class="muted" style="font-size:13px;font-weight:400">${t('· hover an underlined name for what it means', '· 把鼠标停在带下划线的名称上，可查看含义')}</span></h2>${explainedTable(levelHead(lang), input.levels)}
+<h2>${t('Indicators', '指标')}</h2>${explainedTable(statHead(lang), input.stats)}
+<h2>${t('Last 30 sessions', '最近 30 个交易日')}</h2>${table(lang === 'zh' ? ['日期', '开盘', '最高', '最低', '收盘', '涨跌幅', '成交量'] : ['Date', 'Open', 'High', 'Low', 'Close', 'Change', 'Volume'], sessions)}
+<p class="muted">${t('Data: Nasdaq. Signals come from price history only; this is not investment advice.', '数据来源：Nasdaq。信号只来自价格历史，不构成投资建议。')}</p>
 </main></body></html>`
 }

@@ -13,7 +13,8 @@ import {
   slopePct,
   weekly,
 } from './indicators'
-import { biasOf, clampScore, type Bar, type Levels, type ModuleResult, type Reading } from './types'
+import { bi, biasText, joinText } from '../i18n'
+import { biasOf, clampScore, type Bar, type Levels, type ModuleResult, type Reading, type Text } from './types'
 
 const YEAR = 252
 
@@ -29,6 +30,9 @@ const ord = (n: number) => {
 
   return `${r}${s}`
 }
+/** "第 85 百分位" — the zh side of `ord(n) pct`. */
+const pctileZh = (n: number) => `第 ${Math.round(n)} 百分位`
+const rising = (up: boolean) => (up ? bi('rising', '上行') : bi('falling', '下行'))
 
 export function fmtPrice(n: number): string {
   if (!Number.isFinite(n)) return '-'
@@ -86,6 +90,16 @@ export type TrendStats = {
 }
 
 export type TrendResult = ModuleResult & { stats: TrendStats }
+
+const STRUCTURE_ZH: Record<TrendStats['structure'], string> = {
+  'higher highs, higher lows': '高点抬高、低点抬高',
+  'lower highs, lower lows': '高点降低、低点降低',
+  mixed: '高低点交错',
+  unknown: '未知',
+}
+
+/** The swing structure in both languages. */
+export const structureText = (s: TrendStats['structure']): Text => bi(s, STRUCTURE_ZH[s])
 
 /**
  * Score weights (renormalized over the components that exist):
@@ -240,71 +254,94 @@ export function trendModule(bars: Bar[]): TrendResult {
   const readings: Reading[] = []
   if (pairs)
     readings.push({
-      name: 'MA stack',
-      value: `${bullPairs}/${pairs} bullish`,
-      note: bullPairs === pairs ? 'fully bullish order' : bearPairs === pairs ? 'fully bearish order' : `${bearPairs} bearish`,
+      name: bi('MA stack', '均线排列'),
+      value: bi(`${bullPairs}/${pairs} bullish`, `${bullPairs}/${pairs} 组多头`),
+      note:
+        bullPairs === pairs
+          ? bi('fully bullish order', '完全多头排列')
+          : bearPairs === pairs
+            ? bi('fully bearish order', '完全空头排列')
+            : bi(`${bearPairs} bearish`, `${bearPairs} 组空头`),
     })
-  if (maCount) readings.push({ name: 'Price vs MAs', value: `above ${aboveCount}/${maCount}` })
+  if (maCount) readings.push({ name: bi('Price vs MAs', '价格与均线'), value: bi(`above ${aboveCount}/${maCount}`, `站上 ${aboveCount}/${maCount} 条`) })
   for (const [name, v] of [['MA20', ma.ma20], ['MA50', ma.ma50], ['MA200', ma.ma200]] as const)
-    if (fin(v)) readings.push({ name, value: Number(v.toFixed(2)), note: `price ${pct(((close - v) / v) * 100)}` })
-  if (fin(slope20)) readings.push({ name: 'MA20 slope', value: `${pct(slope20, 2)}/day`, note: slope20 > 0 ? 'rising' : 'falling' })
-  if (fin(slope50)) readings.push({ name: 'MA50 slope', value: `${pct(slope50, 2)}/day`, note: slope50 > 0 ? 'rising' : 'falling' })
-  if (a)
+    if (fin(v)) readings.push({ name: bi(name, `${name} 均线`), value: Number(v.toFixed(2)), note: bi(`price ${pct(((close - v) / v) * 100)}`, `现价偏离 ${pct(((close - v) / v) * 100)}`) })
+  if (fin(slope20)) readings.push({ name: bi('MA20 slope', 'MA20 斜率'), value: bi(`${pct(slope20, 2)}/day`, `${pct(slope20, 2)}/日`), note: rising(slope20 > 0) })
+  if (fin(slope50)) readings.push({ name: bi('MA50 slope', 'MA50 斜率'), value: bi(`${pct(slope50, 2)}/day`, `${pct(slope50, 2)}/日`), note: rising(slope50 > 0) })
+  if (a) {
+    const state = a.adx < 20 ? bi('range-bound', '区间震荡') : a.adx >= 25 ? bi('trending', '趋势明确') : bi('weak trend', '趋势偏弱')
+    const di = `+DI ${a.plusDI.toFixed(0)} / −DI ${a.minusDI.toFixed(0)}`
     readings.push({
-      name: 'ADX(14)',
+      name: bi('ADX(14)', 'ADX(14) 趋势强度'),
       value: Number(a.adx.toFixed(1)),
-      note: `${a.adx < 20 ? 'range-bound' : a.adx >= 25 ? 'trending' : 'weak trend'}; +DI ${a.plusDI.toFixed(0)} / −DI ${a.minusDI.toFixed(0)}`,
+      note: bi(`${state.en}; ${di}`, `${state.zh}；${di}`),
     })
-  readings.push({ name: 'Structure (3m)', value: struct.label })
-  if (fin(weeklyStats.ma10) && fin(weeklyStats.close))
+  }
+  readings.push({ name: bi('Structure (3m)', '波段结构（3 个月）'), value: structureText(struct.label) })
+  if (fin(weeklyStats.ma10) && fin(weeklyStats.close)) {
+    const up10 = weeklyStats.close > weeklyStats.ma10
+    const up40 = fin(weeklyStats.ma40) ? weeklyStats.close > weeklyStats.ma40 : undefined
     readings.push({
-      name: 'Weekly',
-      value: `${weeklyStats.close > weeklyStats.ma10 ? 'above' : 'below'} 10w${fin(weeklyStats.ma40) ? `, ${weeklyStats.close > weeklyStats.ma40 ? 'above' : 'below'} 40w` : ''}`,
-      note: fin(wSlope) ? `10w MA ${wSlope > 0 ? 'rising' : 'falling'}` : undefined,
+      name: bi('Weekly', '周线'),
+      value: bi(
+        `${up10 ? 'above' : 'below'} 10w${up40 !== undefined ? `, ${up40 ? 'above' : 'below'} 40w` : ''}`,
+        `${up10 ? '高于' : '低于'} 10 周线${up40 !== undefined ? `，${up40 ? '高于' : '低于'} 40 周线` : ''}`,
+      ),
+      note: fin(wSlope) ? bi(`10w MA ${wSlope > 0 ? 'rising' : 'falling'}`, `10 周均线${wSlope > 0 ? '上行' : '下行'}`) : undefined,
     })
-  if (year.length) readings.push({ name: '52w range position', value: pct0(rangePos * 100), note: `${fmtPrice(low52)} – ${fmtPrice(high52)}` })
+  }
+  if (year.length)
+    readings.push({
+      name: bi('52w range position', '52 周区间位置'),
+      value: pct0(rangePos * 100),
+      note: bi(`${fmtPrice(low52)} – ${fmtPrice(high52)}`, `区间 ${fmtPrice(low52)} – ${fmtPrice(high52)}`),
+    })
 
-  const flags: string[] = []
-  if (rangeBound) flags.push(`Range-bound: ADX ${a!.adx.toFixed(0)} < 20`)
-  else if (a && a.adx >= 40) flags.push(`Very strong trend: ADX ${a.adx.toFixed(0)}`)
+  const flags: Text[] = []
+  if (rangeBound) flags.push(bi(`Range-bound: ADX ${a!.adx.toFixed(0)} < 20`, `区间震荡：ADX ${a!.adx.toFixed(0)} < 20`))
+  else if (a && a.adx >= 40) flags.push(bi(`Very strong trend: ADX ${a.adx.toFixed(0)}`, `趋势极强：ADX ${a.adx.toFixed(0)}`))
   const m50 = ma50s
   const m200 = sma(closes, 200)
   for (let i = closes.length - 1; i >= Math.max(1, closes.length - 10); i--) {
     const x0 = m50[i - 1], y0 = m200[i - 1], x1 = m50[i], y1 = m200[i]
     if (!fin(x0) || !fin(y0) || !fin(x1) || !fin(y1)) break
-    if (x0 <= y0 && x1 > y1) { flags.push('Golden cross (MA50 over MA200) in the last 10 sessions'); break }
-    if (x0 >= y0 && x1 < y1) { flags.push('Death cross (MA50 under MA200) in the last 10 sessions'); break }
+    if (x0 <= y0 && x1 > y1) { flags.push(bi('Golden cross (MA50 over MA200) in the last 10 sessions', '近 10 个交易日出现金叉（MA50 上穿 MA200）')); break }
+    if (x0 >= y0 && x1 < y1) { flags.push(bi('Death cross (MA50 under MA200) in the last 10 sessions', '近 10 个交易日出现死叉（MA50 下穿 MA200）')); break }
   }
-  if (fin(ma.ma200) && close < ma.ma200 && score > 0) flags.push('Below the 200-day MA despite a positive score')
-  if (year.length >= 60 && close >= high52 * 0.99) flags.push('At or near the 52-week high')
-  if (year.length >= 60 && close <= low52 * 1.01) flags.push('At or near the 52-week low')
+  if (fin(ma.ma200) && close < ma.ma200 && score > 0) flags.push(bi('Below the 200-day MA despite a positive score', '评分为正，但价格仍在 200 日均线下方'))
+  if (year.length >= 60 && close >= high52 * 0.99) flags.push(bi('At or near the 52-week high', '处于或接近 52 周高点'))
+  if (year.length >= 60 && close <= low52 * 1.01) flags.push(bi('At or near the 52-week low', '处于或接近 52 周低点'))
   if (fin(comp.weekly) && Math.abs(comp.weekly) >= 0.5 && sign(comp.weekly) !== sign(score) && Math.abs(score) >= 15)
-    flags.push('Weekly trend disagrees with the daily picture')
+    flags.push(bi('Weekly trend disagrees with the daily picture', '周线趋势与日线方向不一致'))
   const atr14 = atr(bars)
-  if (fin(ma.ma20) && atr14 && Math.abs(close - ma.ma20) > 3 * atr14)
-    flags.push(`Extended: ${((close - ma.ma20) / atr14).toFixed(1)} ATR from MA20`)
+  if (fin(ma.ma20) && atr14 && Math.abs(close - ma.ma20) > 3 * atr14) {
+    const x = ((close - ma.ma20) / atr14).toFixed(1)
+    flags.push(bi(`Extended: ${x} ATR from MA20`, `乖离过大：距 MA20 ${x} 个 ATR`))
+  }
 
   const bias = biasOf(score)
   const label =
     bars.length < 20
-      ? 'Not enough history for a trend read'
+      ? bi('Not enough history for a trend read', '历史数据不足，无法判断趋势')
       : score >= 40
-        ? 'Uptrend'
+        ? bi('Uptrend', '上升趋势')
         : score >= 15
-          ? 'Leaning up'
+          ? bi('Leaning up', '偏向上行')
           : score > -15
-            ? 'No clear trend'
+            ? bi('No clear trend', '无明确趋势')
             : score > -40
-              ? 'Leaning down'
-              : 'Downtrend'
+              ? bi('Leaning down', '偏向下行')
+              : bi('Downtrend', '下降趋势')
   const why = [
-    pairs ? `${bullPairs}/${pairs} MA pairs bullish` : '',
-    struct.label !== 'unknown' ? struct.label : '',
-    a ? `ADX ${a.adx.toFixed(0)}${rangeBound ? ' (range-bound)' : ''}` : '',
-  ]
-    .filter(Boolean)
-    .join(', ')
-  const verdict = bars.length < 20 ? `${label}.` : `${label} (${bias}): ${why}.`
+    pairs ? bi(`${bullPairs}/${pairs} MA pairs bullish`, `${bullPairs}/${pairs} 组均线多头`) : undefined,
+    struct.label !== 'unknown' ? structureText(struct.label) : undefined,
+    a ? bi(`ADX ${a.adx.toFixed(0)}${rangeBound ? ' (range-bound)' : ''}`, `ADX ${a.adx.toFixed(0)}${rangeBound ? '（区间震荡）' : ''}`) : undefined,
+  ].filter((x): x is Text => x !== undefined)
+  const whyText = joinText(why, ', ', '，')
+  const verdict =
+    bars.length < 20
+      ? bi(`${label.en}.`, `${label.zh}。`)
+      : bi(`${label.en} (${bias}): ${whyText.en}.`, `${label.zh}（${biasText(bias).zh}）：${whyText.zh}。`)
 
   return { key: 'trend', score, confidence, verdict, readings, flags, stats }
 }
@@ -345,6 +382,17 @@ export type VolatilityStats = {
 }
 
 export type VolatilityResult = ModuleResult & { stats: VolatilityStats }
+
+const VOL_TREND_ZH: Record<VolatilityStats['volTrend'], string> = { expanding: '放大', contracting: '收敛', stable: '平稳', unknown: '未知' }
+const IV_RICH_ZH: Record<NonNullable<VolatilityStats['ivRich']>, string> = { rich: '偏贵', cheap: '偏便宜', fair: '合理' }
+const SIGMA_SOURCE_ZH: Record<VolatilityStats['sigmaSource'], string> = { iv: '隐含波动率', realized: '已实现波动率', none: '无' }
+
+/** Realized-vol trend (RV10 vs RV60) in both languages. */
+export const volTrendText = (t: VolatilityStats['volTrend']): Text => bi(t, VOL_TREND_ZH[t])
+/** Options priced rich / cheap / fair against realized vol. */
+export const ivRichText = (r: NonNullable<VolatilityStats['ivRich']>): Text => bi(r, IV_RICH_ZH[r])
+/** Where the forecast sigma came from ('iv' / 'realized' / 'none' stay the English words). */
+export const sigmaSourceText = (s: VolatilityStats['sigmaSource']): Text => bi(s, SIGMA_SOURCE_ZH[s])
 
 /**
  * Score weights (renormalized): RV20 level vs its year 40, vol trend
@@ -408,37 +456,68 @@ export function volatilityModule(bars: Bar[], opts?: { iv?: number }): Volatilit
 
   const readings: Reading[] = []
   const vp = (x: number | undefined) => (fin(x) ? `${(x * 100).toFixed(1)}%` : '-')
-  if (fin(rv20)) readings.push({ name: 'RV10 / RV20 / RV60', value: `${vp(rv10)} / ${vp(rv20)} / ${vp(rv60)}`, note: 'annualized' })
-  if (fin(rvPct1y)) readings.push({ name: 'RV20 percentile (1y)', value: Math.round(rvPct1y), note: rvPct1y >= 80 ? 'stressed' : rvPct1y <= 20 ? 'calm' : 'normal' })
-  if (fin(atrPct)) readings.push({ name: 'ATR(14) % of price', value: `${atrPct.toFixed(2)}%` })
+  if (fin(rv20))
+    readings.push({ name: bi('RV10 / RV20 / RV60', '已实现波动率 RV10 / RV20 / RV60'), value: `${vp(rv10)} / ${vp(rv20)} / ${vp(rv60)}`, note: bi('annualized', '年化') })
+  if (fin(rvPct1y))
+    readings.push({
+      name: bi('RV20 percentile (1y)', 'RV20 一年分位'),
+      value: Math.round(rvPct1y),
+      note: rvPct1y >= 80 ? bi('stressed', '高压') : rvPct1y <= 20 ? bi('calm', '平静') : bi('normal', '正常'),
+    })
+  if (fin(atrPct)) readings.push({ name: bi('ATR(14) % of price', 'ATR(14) 占价格比例'), value: `${atrPct.toFixed(2)}%` })
   if (fin(bandwidth))
-    readings.push({ name: 'Bollinger bandwidth', value: `${(bandwidth * 100).toFixed(1)}%`, note: fin(bandwidthPct) ? `${ord(bandwidthPct)} pct of 1y` : undefined })
-  if (fin(volRatio)) readings.push({ name: 'RV10 / RV60', value: Number(volRatio.toFixed(2)), note: volTrend })
-  if (fin(iv)) readings.push({ name: 'IV − RV20', value: `${((ivRvSpread ?? 0) * 100).toFixed(1)} pts`, note: `IV ${vp(iv)}, options ${ivRich}` })
-  if (fin(sigma)) readings.push({ name: 'Forecast sigma', value: vp(sigma), note: sigmaSource === 'iv' ? 'implied vol' : 'max(RV20, avg of RV20 and RV60)' })
+    readings.push({
+      name: bi('Bollinger bandwidth', '布林带宽度'),
+      value: `${(bandwidth * 100).toFixed(1)}%`,
+      note: fin(bandwidthPct) ? bi(`${ord(bandwidthPct)} pct of 1y`, `一年内${pctileZh(bandwidthPct)}`) : undefined,
+    })
+  if (fin(volRatio)) readings.push({ name: bi('RV10 / RV60', 'RV10 / RV60 比值'), value: Number(volRatio.toFixed(2)), note: volTrendText(volTrend) })
+  if (fin(iv)) {
+    const pts = ((ivRvSpread ?? 0) * 100).toFixed(1)
+    readings.push({
+      name: bi('IV − RV20', 'IV − RV20 差值'),
+      value: bi(`${pts} pts`, `${pts} 个百分点`),
+      note: bi(`IV ${vp(iv)}, options ${ivRich}`, `IV ${vp(iv)}，期权${ivRich ? IV_RICH_ZH[ivRich] : '未知'}`),
+    })
+  }
+  if (fin(sigma))
+    readings.push({
+      name: bi('Forecast sigma', '预测用波动率（σ）'),
+      value: vp(sigma),
+      note: sigmaSource === 'iv' ? bi('implied vol', '隐含波动率') : bi('max(RV20, avg of RV20 and RV60)', '取 RV20 与（RV20、RV60 均值）中的较大者'),
+    })
 
-  const flags: string[] = []
-  if (squeeze) flags.push(`Bollinger squeeze: bandwidth at ${ord(bandwidthPct!)} pct of 1y, breakout risk either way`)
-  if (volTrend === 'expanding') flags.push(`Volatility expanding: RV10 ${volRatio!.toFixed(2)}× RV60`)
-  if (fin(rvPct1y) && rvPct1y >= 90) flags.push(`RV20 at ${ord(rvPct1y)} pct of the past year: stressed`)
-  if (ivRich === 'rich') flags.push(`Options rich: IV ${vp(iv)} vs RV20 ${vp(rv20)}`)
-  if (ivRich === 'cheap') flags.push(`Options cheap: IV ${vp(iv)} vs RV20 ${vp(rv20)}`)
-  if (volTrend === 'contracting' && !squeeze) flags.push('Volatility contracting')
+  const flags: Text[] = []
+  if (squeeze)
+    flags.push(
+      bi(
+        `Bollinger squeeze: bandwidth at ${ord(bandwidthPct!)} pct of 1y, breakout risk either way`,
+        `布林带收口（squeeze）：带宽处于一年内${pctileZh(bandwidthPct!)}，双向均有突破风险`,
+      ),
+    )
+  if (volTrend === 'expanding') flags.push(bi(`Volatility expanding: RV10 ${volRatio!.toFixed(2)}× RV60`, `波动率放大：RV10 为 RV60 的 ${volRatio!.toFixed(2)} 倍`))
+  if (fin(rvPct1y) && rvPct1y >= 90) flags.push(bi(`RV20 at ${ord(rvPct1y)} pct of the past year: stressed`, `RV20 处于过去一年${pctileZh(rvPct1y)}：高压`))
+  if (ivRich === 'rich') flags.push(bi(`Options rich: IV ${vp(iv)} vs RV20 ${vp(rv20)}`, `期权偏贵：IV ${vp(iv)}，RV20 ${vp(rv20)}`))
+  if (ivRich === 'cheap') flags.push(bi(`Options cheap: IV ${vp(iv)} vs RV20 ${vp(rv20)}`, `期权偏便宜：IV ${vp(iv)}，RV20 ${vp(rv20)}`))
+  if (volTrend === 'contracting' && !squeeze) flags.push(bi('Volatility contracting', '波动率收敛'))
 
   const state = !fin(rv20)
-    ? 'Not enough history for a volatility read'
+    ? bi('Not enough history for a volatility read', '历史数据不足，无法判断波动率')
     : score >= 40
-      ? 'Calm, compressing volatility'
+      ? bi('Calm, compressing volatility', '波动平静且在收敛')
       : score >= 15
-        ? 'Volatility on the calm side'
+        ? bi('Volatility on the calm side', '波动率偏低')
         : score > -15
-          ? 'Normal volatility'
+          ? bi('Normal volatility', '波动率正常')
           : score > -40
-            ? 'Volatility elevated'
-            : 'Stressed, expanding volatility'
+            ? bi('Volatility elevated', '波动率偏高')
+            : bi('Stressed, expanding volatility', '波动高压且在放大')
   const verdict = fin(rv20)
-    ? `${state}: RV20 ${vp(rv20)}${fin(rvPct1y) ? ` (${ord(rvPct1y)} pct of 1y)` : ''}, ${volTrend}${squeeze ? ', squeeze on' : ''}.`
-    : `${state}.`
+    ? bi(
+        `${state.en}: RV20 ${vp(rv20)}${fin(rvPct1y) ? ` (${ord(rvPct1y)} pct of 1y)` : ''}, ${volTrend}${squeeze ? ', squeeze on' : ''}.`,
+        `${state.zh}：RV20 ${vp(rv20)}${fin(rvPct1y) ? `（一年内${pctileZh(rvPct1y)}）` : ''}，${VOL_TREND_ZH[volTrend]}${squeeze ? '，布林带收口' : ''}。`,
+      )
+    : bi(`${state.en}.`, `${state.zh}。`)
 
   return {
     key: 'volatility',
@@ -474,12 +553,18 @@ export type VolumeStats = {
     volVs50?: number
     /** Close location in the day's range, 0 = low, 1 = high. */
     closeLocation?: number
-    character: string
+    /** e.g. "up day on heavy volume" / "放量上涨日". */
+    character: Text
   }
   components: Record<string, number | undefined>
 }
 
 export type VolumeResult = ModuleResult & { stats: VolumeStats }
+
+const DIVERGENCE_ZH: Record<VolumeStats['divergence'], string> = { bearish: '顶背离', bullish: '底背离', none: '无背离' }
+
+/** Price/OBV divergence in both languages. */
+export const divergenceText = (d: VolumeStats['divergence']): Text => bi(d, DIVERGENCE_ZH[d])
 
 /**
  * Score weights (renormalized): up/down volume ratio 30, OBV slope 25,
@@ -536,17 +621,19 @@ export function volumeModule(bars: Bar[]): VolumeResult {
   const range = lastBar ? lastBar.h - lastBar.l : undefined
   const rangeVsAtr = fin(range) && atr14 ? range / atr14 : undefined
   const closeLocation = lastBar && range && range > 0 ? (lastBar.c - lastBar.l) / range : undefined
-  let character = 'ordinary session'
+  let character = bi('ordinary session', '普通交易日')
   let lastScore: number | undefined
   if (fin(changePct) && fin(volVs50)) {
     const heavy = volVs50 >= 1.5
     const wide = fin(rangeVsAtr) && rangeVsAtr >= 1.5
     const moveAtr = atr14 && lastBar && prev ? Math.abs(lastBar.c - prev.c) / atr14 : 0
-    if (heavy && wide) character = `wide-range ${changePct >= 0 ? 'up' : 'down'} day on heavy volume`
-    else if (heavy && moveAtr < 0.3) character = 'churn: heavy volume, little progress'
-    else if (heavy) character = `${changePct >= 0 ? 'up' : 'down'} day on heavy volume`
-    else if (volVs50 < 0.7) character = `quiet ${changePct >= 0 ? 'up' : 'down'} day on light volume`
-    else character = `${changePct >= 0 ? 'up' : 'down'} day on normal volume`
+    const up = changePct >= 0
+    const ud = up ? 'up' : 'down'
+    if (heavy && wide) character = bi(`wide-range ${ud} day on heavy volume`, `放量宽幅${up ? '上涨' : '下跌'}日`)
+    else if (heavy && moveAtr < 0.3) character = bi('churn: heavy volume, little progress', '放量滞涨：成交放大但价格几乎未动')
+    else if (heavy) character = bi(`${ud} day on heavy volume`, `放量${up ? '上涨' : '下跌'}日`)
+    else if (volVs50 < 0.7) character = bi(`quiet ${ud} day on light volume`, `缩量${up ? '小涨' : '小跌'}日`)
+    else character = bi(`${ud} day on normal volume`, `量能正常的${up ? '上涨' : '下跌'}日`)
     // heavier volume makes the day count more; closing near the high (low) adds to an up (down) read
     const weightByVol = clamp(volVs50 - 0.7, 0, 1)
     const loc = fin(closeLocation) ? (closeLocation - 0.5) * 2 : 0
@@ -568,40 +655,59 @@ export function volumeModule(bars: Bar[]): VolumeResult {
   confidence = hasVolume && n > 20 ? clamp(confidence, 0.05, 0.9) : 0
 
   const readings: Reading[] = []
-  if (fin(volVs50)) readings.push({ name: 'Volume vs 50d avg', value: `${volVs50.toFixed(2)}×` })
-  if (fin(upDownRatio20)) readings.push({ name: 'Up/down volume (20d)', value: Number(upDownRatio20.toFixed(2)), note: upDownRatio20 >= 1.2 ? 'buyers heavier' : upDownRatio20 <= 0.83 ? 'sellers heavier' : 'balanced' })
-  if (fin(obvSlope20)) readings.push({ name: 'OBV slope (20d)', value: Number(obvSlope20.toFixed(2)), note: `price ${pct(priceSlope20 ?? 0, 2)}/day` })
-  readings.push({ name: 'Distribution / accumulation (25d)', value: `${distributionDays} / ${accumulationDays}` })
+  if (fin(volVs50)) readings.push({ name: bi('Volume vs 50d avg', '成交量 / 50 日均量'), value: `${volVs50.toFixed(2)}×` })
+  if (fin(upDownRatio20))
+    readings.push({
+      name: bi('Up/down volume (20d)', '上涨/下跌成交量比（20 日）'),
+      value: Number(upDownRatio20.toFixed(2)),
+      note: upDownRatio20 >= 1.2 ? bi('buyers heavier', '买盘更重') : upDownRatio20 <= 0.83 ? bi('sellers heavier', '卖盘更重') : bi('balanced', '买卖均衡'),
+    })
+  if (fin(obvSlope20))
+    readings.push({ name: bi('OBV slope (20d)', 'OBV 斜率（20 日）'), value: Number(obvSlope20.toFixed(2)), note: bi(`price ${pct(priceSlope20 ?? 0, 2)}/day`, `价格 ${pct(priceSlope20 ?? 0, 2)}/日`) })
+  readings.push({ name: bi('Distribution / accumulation (25d)', '派发日 / 吸筹日（25 日）'), value: `${distributionDays} / ${accumulationDays}` })
   readings.push({
-    name: 'Last session',
+    name: bi('Last session', '最近交易日'),
     value: character,
-    note: [fin(changePct) ? pct(changePct, 2) : '', fin(rangeVsAtr) ? `range ${rangeVsAtr.toFixed(1)}× ATR` : '', fin(volVs50) ? `vol ${volVs50.toFixed(1)}×` : '']
-      .filter(Boolean)
-      .join(', '),
+    note: joinText(
+      [
+        fin(changePct) ? pct(changePct, 2) : '',
+        fin(rangeVsAtr) ? bi(`range ${rangeVsAtr.toFixed(1)}× ATR`, `振幅 ${rangeVsAtr.toFixed(1)} 倍 ATR`) : '',
+        fin(volVs50) ? bi(`vol ${volVs50.toFixed(1)}×`, `量 ${volVs50.toFixed(1)} 倍均量`) : '',
+      ].filter(x => x !== ''),
+      ', ',
+      '，',
+    ),
   })
 
-  const flags: string[] = []
-  if (!hasVolume) flags.push('No volume data')
-  if (divergence === 'bearish') flags.push('Bearish divergence: price rising while OBV falls')
-  if (divergence === 'bullish') flags.push('Bullish divergence: price falling while OBV rises')
-  if (distributionDays >= 5) flags.push(`${distributionDays} distribution days in 25 sessions: institutional selling`)
-  if (accumulationDays >= 5 && accumulationDays - distributionDays >= 3) flags.push(`${accumulationDays} accumulation days in 25 sessions`)
-  if (fin(volVs50) && volVs50 >= 2) flags.push(`Last session: ${character} (${volVs50.toFixed(1)}× average)`)
+  const flags: Text[] = []
+  if (!hasVolume) flags.push(bi('No volume data', '无成交量数据'))
+  if (divergence === 'bearish') flags.push(bi('Bearish divergence: price rising while OBV falls', '顶背离：价格上涨而 OBV 下降'))
+  if (divergence === 'bullish') flags.push(bi('Bullish divergence: price falling while OBV rises', '底背离：价格下跌而 OBV 上升'))
+  if (distributionDays >= 5)
+    flags.push(bi(`${distributionDays} distribution days in 25 sessions: institutional selling`, `25 个交易日内出现 ${distributionDays} 个派发日：机构在卖出`))
+  if (accumulationDays >= 5 && accumulationDays - distributionDays >= 3)
+    flags.push(bi(`${accumulationDays} accumulation days in 25 sessions`, `25 个交易日内出现 ${accumulationDays} 个吸筹日`))
+  if (fin(volVs50) && volVs50 >= 2)
+    flags.push(bi(`Last session: ${character.en} (${volVs50.toFixed(1)}× average)`, `最近交易日：${character.zh}（均量的 ${volVs50.toFixed(1)} 倍）`))
 
   const label = !hasVolume
-    ? 'No volume read'
+    ? bi('No volume read', '无成交量判断')
     : score >= 40
-      ? 'Accumulation'
+      ? bi('Accumulation', '吸筹')
       : score >= 15
-        ? 'Volume leans positive'
+        ? bi('Volume leans positive', '量能偏积极')
         : score > -15
-          ? 'Volume neutral'
+          ? bi('Volume neutral', '量能中性')
           : score > -40
-            ? 'Volume leans negative'
-            : 'Distribution'
+            ? bi('Volume leans negative', '量能偏消极')
+            : bi('Distribution', '派发')
+  const udr = fin(upDownRatio20) ? upDownRatio20.toFixed(2) : '-'
   const verdict = hasVolume
-    ? `${label}: up/down volume ${fin(upDownRatio20) ? upDownRatio20.toFixed(2) : '-'}, ${distributionDays} distribution vs ${accumulationDays} accumulation days${divergence !== 'none' ? `, ${divergence} OBV divergence` : ''}.`
-    : `${label}.`
+    ? bi(
+        `${label.en}: up/down volume ${udr}, ${distributionDays} distribution vs ${accumulationDays} accumulation days${divergence !== 'none' ? `, ${divergence} OBV divergence` : ''}.`,
+        `${label.zh}：上涨/下跌成交量比 ${udr}，派发日 ${distributionDays} 个、吸筹日 ${accumulationDays} 个${divergence !== 'none' ? `，OBV ${DIVERGENCE_ZH[divergence]}` : ''}。`,
+      )
+    : bi(`${label.en}.`, `${label.zh}。`)
 
   return {
     key: 'volume',
@@ -629,6 +735,19 @@ export function volumeModule(bars: Bar[]): VolumeResult {
 
 export type LevelKind = 'swing high' | 'swing low' | 'MA20' | 'MA50' | 'MA200' | '52w high' | '52w low'
 export type LevelPoint = { price: number; kind: LevelKind; date?: string }
+
+const LEVEL_KIND_ZH: Record<LevelKind, string> = {
+  'swing high': '波段高点',
+  'swing low': '波段低点',
+  MA20: '20 日均线',
+  MA50: '50 日均线',
+  MA200: '200 日均线',
+  '52w high': '52 周高点',
+  '52w low': '52 周低点',
+}
+
+/** What a key level is, in both languages. */
+export const levelKindText = (kind: LevelKind): Text => bi(kind, LEVEL_KIND_ZH[kind])
 
 const LEVEL_RANK: Record<LevelKind, number> = { '52w high': 5, '52w low': 5, MA200: 4, MA50: 3, 'swing high': 2, 'swing low': 2, MA20: 1 }
 

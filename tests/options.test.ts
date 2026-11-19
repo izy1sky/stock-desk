@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Fetch } from '../hooks/engine/http'
+import { isText, type Text } from '../hooks/i18n'
 import {
   analyzeChain,
   bsGamma,
@@ -9,10 +10,28 @@ import {
   loadVolIndexes,
   optionsModule,
   parseOcc,
+  skewReadText,
+  volRegimeText,
   type Chain,
   type Contract,
   type OptionType,
 } from '../hooks/engine/options'
+
+/** Every Text pair inside a value, with where it sits. */
+function texts(x: unknown, path = '$', out: { path: string; t: Text }[] = []): { path: string; t: Text }[] {
+  if (Array.isArray(x)) x.forEach((v, i) => texts(v, `${path}[${i}]`, out))
+  else if (isText(x)) out.push({ path, t: x })
+  else if (x && typeof x === 'object') for (const [k, v] of Object.entries(x)) texts(v, `${path}.${k}`, out)
+
+  return out
+}
+
+/** Each non-empty Text has a Chinese side with at least one CJK character. */
+function expectTranslated(x: unknown) {
+  const all = texts(x)
+  expect(all.length).toBeGreaterThan(0)
+  expect(all.filter(({ t }) => t.en !== '' && !/[一-鿿]/.test(t.zh)).map(({ path, t }) => `${path}: ${t.zh}`)).toEqual([])
+}
 
 type Res = { status: number; ok: boolean; headers: Record<string, string>; text: string }
 const json = (body: unknown): Res => ({ status: 200, ok: true, headers: {}, text: JSON.stringify(body) })
@@ -188,7 +207,8 @@ test('dealer gamma: calls add, puts subtract, walls sit on the biggest strikes e
   expect(s.gex.byStrike.find(r => r.strike === 95)!.put).toBeLessThan(0)
   expect(s.gex.callWall).toBe(105)
   expect(s.gex.putWall).toBe(95)
-  expect(s.gex.note).toMatch(/short the puts/)
+  expect(s.gex.note.en).toMatch(/short the puts/)
+  expect(s.gex.note.zh).toContain('做市商伽马（GEX）')
 })
 
 test('the gamma flip is found between the put and call strikes, and the module reads it', () => {
@@ -211,15 +231,23 @@ test('the gamma flip is found between the put and call strikes, and the module r
   const bear = optionsModule(heavy, { vix: { value: 30 }, vix3m: { value: 25 }, vixToVix3m: 1.2, regime: 'backwardation (stress)' })
   expect(bear.key).toBe('options')
   expect(bear.score).toBeLessThan(-15)
-  expect(bear.flags.join(' ')).toMatch(/short gamma/)
-  expect(bear.flags.join(' ')).toMatch(/backwardation/)
+  expect(bear.flags.map(f => f.en).join(' ')).toMatch(/short gamma/)
+  expect(bear.flags.map(f => f.en).join(' ')).toMatch(/backwardation/)
+  expect(bear.flags.map(f => f.zh).join(' ')).toContain('负伽马')
+  expect(bear.flags.map(f => f.zh).join(' ')).toContain('贴水（backwardation）')
   expect(bear.levels).toEqual({ callWall: 105, putWall: 95, gammaFlip: heavy.gex.flip, maxPain: 95 })
-  expect(bear.verdict).toMatch(/short gamma below the 10\d\.\d flip/)
+  expect(bear.verdict.en).toMatch(/short gamma below the 10\d\.\d flip/)
+  expect(bear.verdict.zh).toMatch(/^期权持仓信号(偏空|看空)：做市商在 10\d\.\d 伽马翻转点（gamma flip）下方看起来处于负伽马/)
+  expectTranslated(bear)
+  expect(bear.readings.find(r => r.name.en === 'VIX')!.note).toEqual(volRegimeText('backwardation (stress)'))
 
   // A third of the puts: long gamma well above the flip.
   const bull = optionsModule(build(1500), { vix: { value: 14 }, vix3m: { value: 17 }, vixToVix3m: 14 / 17, regime: 'contango (calm)' })
   expect(bull.score).toBeGreaterThan(15)
-  expect(bull.verdict).toMatch(/long gamma/)
+  expect(bull.verdict.en).toMatch(/long gamma/)
+  expect(bull.verdict.zh).toContain('正伽马')
+  expect(bull.flags.some(f => f.zh.startsWith('期权市场清淡'))).toBe(true)
+  expectTranslated(bull)
   // Tiny open interest: low confidence.
   expect(bull.confidence).toBeLessThan(0.3)
 })
@@ -260,4 +288,26 @@ test('volatility indexes: ratios and regime, tolerating a missing index', async 
   expect(v.vix9dToVix).toBe(1.2)
   expect(v.vixToVix3m).toBe(25 / 22)
   expect(v.regime).toBe('backwardation (stress)')
+})
+
+test('options text comes in both languages', () => {
+  // Steep put skew, unusual volume, a call wall just overhead and an inverted chain term structure.
+  const near = '2026-11-27'
+  const far = '2027-02-19'
+  const contracts: Contract[] = []
+  for (const k of [90, 95, 100, 100.5, 105, 110]) {
+    contracts.push(c(near, 8, 'C', k, { iv: k >= 100 ? 0.3 : 0.32, oi: k === 100.5 ? 9000 : 500, volume: 50 }))
+    contracts.push(c(near, 8, 'P', k, { iv: k <= 100 ? 0.45 + (100 - k) * 0.03 : 0.3, oi: 400, volume: k === 90 ? 20000 : 600 }))
+    contracts.push(c(far, 92, 'C', k, { iv: 0.2, oi: 300 }))
+    contracts.push(c(far, 92, 'P', k, { iv: 0.24, oi: 300 }))
+  }
+  const s = analyzeChain(chainOf(contracts))
+  const m = optionsModule(s, { vix: { value: 22 }, vix9d: { value: 26 }, vix3m: { value: 20 }, vix9dToVix: 26 / 22, vixToVix3m: 1.1, regime: 'backwardation (stress)' })
+  expectTranslated(m)
+  expectTranslated(s.gex.note)
+  for (const r of ['steep', 'normal', 'flat', 'call skew'] as const) expect(skewReadText(r).en).toBe(r)
+  expectTranslated((['steep', 'normal', 'flat', 'call skew'] as const).map(skewReadText))
+  for (const r of ['contango (calm)', 'flat', 'backwardation (stress)'] as const) expect(volRegimeText(r).en).toBe(r)
+  expectTranslated((['contango (calm)', 'flat', 'backwardation (stress)'] as const).map(volRegimeText))
+  expect(m.flags.length).toBeGreaterThan(2)
 })

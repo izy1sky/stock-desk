@@ -1,8 +1,37 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Bar } from '../types'
+import { isText, type Text } from '../hooks/i18n'
 import { adx, ema, normCdf, percentileRank, realizedVol, slopePct, weekly } from '../hooks/engine/indicators'
-import { keyLevels, trendModule, volatilityModule, volumeModule } from '../hooks/engine/technicals'
+import {
+  divergenceText,
+  ivRichText,
+  keyLevels,
+  keyLevelsDetail,
+  levelKindText,
+  sigmaSourceText,
+  structureText,
+  trendModule,
+  volatilityModule,
+  volTrendText,
+  volumeModule,
+} from '../hooks/engine/technicals'
+
+/** Every Text pair inside a value, with where it sits. */
+function texts(x: unknown, path = '$', out: { path: string; t: Text }[] = []): { path: string; t: Text }[] {
+  if (Array.isArray(x)) x.forEach((v, i) => texts(v, `${path}[${i}]`, out))
+  else if (isText(x)) out.push({ path, t: x })
+  else if (x && typeof x === 'object') for (const [k, v] of Object.entries(x)) texts(v, `${path}.${k}`, out)
+
+  return out
+}
+
+/** Each non-empty Text has a Chinese side with at least one CJK character. */
+function expectTranslated(x: unknown) {
+  const all = texts(x)
+  expect(all.length).toBeGreaterThan(0)
+  expect(all.filter(({ t }) => t.en !== '' && !/[一-鿿]/.test(t.zh)).map(({ path, t }) => `${path}: ${t.zh}`)).toEqual([])
+}
 
 // Deterministic normal noise (LCG + Box-Muller).
 function noise(seed: number): () => number {
@@ -81,7 +110,8 @@ test('a steady uptrend scores bullish with a full MA stack', () => {
   expect(t.score).toBeGreaterThan(40)
   expect(t.stats.bullPairs).toBe(4)
   expect(t.stats.rangePos).toBeGreaterThan(0.7)
-  expect(t.verdict).toMatch(/^Uptrend/)
+  expect(t.verdict.en).toMatch(/^Uptrend/)
+  expect(t.verdict.zh).toMatch(/^上升趋势（看多）：/)
   const a = adx(bars)!
   expect(a.plusDI).toBeGreaterThan(a.minusDI)
 })
@@ -92,6 +122,9 @@ test('a steady downtrend scores bearish', () => {
   expect(t.score).toBeLessThan(-40)
   expect(t.stats.bearPairs).toBeGreaterThanOrEqual(3)
   expect(t.stats.structure).not.toBe('higher highs, higher lows')
+  expect(t.verdict.en).toMatch(/^Downtrend \(bearish\)/)
+  expect(t.verdict.zh).toContain('下降趋势')
+  expect(t.verdict.zh).toContain('看空')
 })
 
 test('a choppy range is neutral and range-bound', () => {
@@ -100,14 +133,17 @@ test('a choppy range is neutral and range-bound', () => {
   expect(Math.abs(t.score)).toBeLessThan(25)
   expect(t.stats.adx!).toBeLessThan(25)
   expect(t.stats.rangeBound).toBe(true)
-  expect(t.flags.some(f => f.startsWith('Range-bound'))).toBe(true)
+  expect(t.flags.some(f => f.en.startsWith('Range-bound'))).toBe(true)
+  expect(t.flags.some(f => f.zh.startsWith('区间震荡：ADX'))).toBe(true)
 })
 
 test('a volatility squeeze is flagged, then the breakout reads as expanding vol and accumulation', () => {
   const calm = series([...repeat(300, { drift: 0, vol: 0.015 }), ...repeat(40, { drift: 0, vol: 0.002 })])
   const v = volatilityModule(calm)
   expect(v.stats.squeeze).toBe(true)
-  expect(v.flags.some(f => f.startsWith('Bollinger squeeze'))).toBe(true)
+  expect(v.flags.some(f => f.en.startsWith('Bollinger squeeze'))).toBe(true)
+  expect(v.flags.some(f => f.zh.startsWith('布林带收口（squeeze）'))).toBe(true)
+  expect(v.verdict.zh).toContain('布林带收口')
   expect(v.score).toBeGreaterThan(15)
   expect(v.stats.sigma!).toBeGreaterThanOrEqual(v.stats.rv20!)
 
@@ -144,7 +180,9 @@ test('selling on rising volume counts distribution days and scores negative', ()
   expect(v.stats.distributionDays).toBeGreaterThanOrEqual(10)
   expect(v.stats.accumulationDays).toBeLessThanOrEqual(1)
   expect(v.score).toBeLessThan(-30)
-  expect(v.flags.some(f => /distribution days/.test(f))).toBe(true)
+  expect(v.flags.some(f => /distribution days/.test(f.en))).toBe(true)
+  expect(v.flags.some(f => /派发日/.test(f.zh))).toBe(true)
+  expect(v.verdict.zh).toMatch(/派发日 \d+ 个/)
 })
 
 test('key levels sit on the right side of price, nearest first, at least 1% apart', () => {
@@ -171,4 +209,47 @@ test('short histories degrade gracefully', () => {
   expect(volatilityModule(bars).stats.sigma).toBeUndefined()
   expect(volumeModule([]).score).toBe(0)
   expect(keyLevels([])).toEqual({ supports: [], resistances: [] })
+})
+
+test('trend, volatility and volume speak Chinese everywhere, English unchanged', () => {
+  const up = series(repeat(320, { drift: 0.0015, vol: 0.01 }))
+  const range = series(repeat(320, { drift: 0, vol: 0.01, meanRevert: 0.3 }))
+  const calm = series([...repeat(300, { drift: 0, vol: 0.015 }), ...repeat(40, { drift: 0, vol: 0.002 })])
+  const breakout = series([...repeat(300, { drift: 0, vol: 0.015 }), ...repeat(40, { drift: 0, vol: 0.002 }), ...repeat(8, { drift: 0.02, vol: 0.03, volume: 3e6 })])
+  for (const bars of [up, range, breakout, series(repeat(15, { drift: 0.001, vol: 0.01 }))]) expectTranslated(trendModule(bars))
+  for (const r of [volatilityModule(calm), volatilityModule(calm, { iv: 0.4 }), volatilityModule(breakout, { iv: 0.05 }), volatilityModule(series(repeat(15, { drift: 0, vol: 0.01 })))])
+    expectTranslated(r)
+  for (const bars of [breakout, calm, up]) expectTranslated(volumeModule(bars))
+  expectTranslated(volumeModule([]))
+
+  const t = trendModule(up)
+  const stack = t.readings.find(r => r.name.en === 'MA stack')!
+  expect(stack.name.zh).toBe('均线排列')
+  expect(stack.note).toEqual({ en: 'fully bullish order', zh: '完全多头排列' })
+  expect(t.readings.find(r => r.name.en === 'Structure (3m)')!.value).toEqual(structureText(t.stats.structure))
+
+  const v = volatilityModule(calm, { iv: 0.4 })
+  expect(v.flags.some(f => f.zh.startsWith('期权偏贵：IV 40.0%'))).toBe(true)
+  expect(v.readings.find(r => r.name.en === 'Forecast sigma')!.note).toEqual({ en: 'implied vol', zh: '隐含波动率' })
+
+  const vol = volumeModule(breakout)
+  expect(vol.stats.lastSession.character.en).toMatch(/day/)
+  expect(vol.stats.lastSession.character.zh).toMatch(/[一-鿿]/)
+})
+
+test('enum translators cover every key', () => {
+  for (const k of ['higher highs, higher lows', 'lower highs, lower lows', 'mixed', 'unknown'] as const) expect(structureText(k).en).toBe(k)
+  expect(structureText('higher highs, higher lows').zh).toBe('高点抬高、低点抬高')
+  for (const k of ['expanding', 'contracting', 'stable', 'unknown'] as const) expectTranslated(volTrendText(k))
+  expect(volTrendText('expanding').zh).toBe('放大')
+  for (const k of ['rich', 'cheap', 'fair'] as const) expectTranslated(ivRichText(k))
+  for (const k of ['iv', 'realized', 'none'] as const) expectTranslated(sigmaSourceText(k))
+  for (const k of ['bearish', 'bullish', 'none'] as const) expectTranslated(divergenceText(k))
+  expect(divergenceText('bearish').zh).toBe('顶背离')
+  const kinds = ['swing high', 'swing low', 'MA20', 'MA50', 'MA200', '52w high', '52w low'] as const
+  for (const k of kinds) expect(levelKindText(k).en).toBe(k)
+  expectTranslated(kinds.map(levelKindText))
+  expect(levelKindText('52w high').zh).toBe('52 周高点')
+  const d = keyLevelsDetail(series(repeat(300, { drift: 0, vol: 0.015 }), 11))
+  expectTranslated([...d.supports, ...d.resistances].map(l => levelKindText(l.kind)))
 })

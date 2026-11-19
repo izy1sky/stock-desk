@@ -5,6 +5,7 @@
 
 import type { AssetClass } from '../../types'
 import { loadHistory } from '../data'
+import { bi, pick, type Lang } from '../i18n'
 import { analogs, expectedMoves, probAbove, probTouch, scenarios } from './forecast'
 import type { AnalogStudy, ExpectedMove, Scenarios } from './forecast'
 import {
@@ -23,11 +24,11 @@ import {
 import type { BetaStats, CashQuote, CotStats, FuturesQuote, ImpliedCash, IndexSymbol, Projection } from './futures'
 import type { Fetch } from './http'
 import { analyzeChain, fmtGex, loadChain, loadVolIndexes, optionsModule } from './options'
-import type { OptionsLevels, OptionsStats, VolIndexes } from './options'
+import type { OptionsLevels, OptionsStats, SkewRead, VolIndexes } from './options'
 import { fmtPrice, keyLevelsDetail, trendModule, volatilityModule, volumeModule } from './technicals'
 import type { LevelPoint } from './technicals'
 import { biasOf, clampScore } from './types'
-import type { Bar, Bias, ModuleKey, ModuleResult } from './types'
+import type { Bar, Bias, ModuleKey, ModuleResult, Text } from './types'
 
 // ---------------------------------------------------------------- weights
 
@@ -98,9 +99,9 @@ export type OptionsSummary = {
   ivAtm30?: number
   termRatio?: number
   term: { expiry: string; days: number; iv: number }[]
-  skew?: { expiry: string; days: number; put25: number; call25: number; skew: number; read: string }
+  skew?: { expiry: string; days: number; put25: number; call25: number; skew: number; read: SkewRead }
   gexTotal: number
-  gexNote: string
+  gexNote: Text
   levels: OptionsLevels
   maxPainNearest?: { expiry: string; strike: number }
   maxPainMonthly?: { expiry: string; strike: number }
@@ -132,7 +133,7 @@ export type Report = {
   scenarios: Scenarios
   analogs: AnalogStudy
   /** Event risk and other caveats the reader must weigh. */
-  notes: string[]
+  notes: Text[]
   /** Sources that failed: each a short line. */
   errors: string[]
 }
@@ -222,7 +223,7 @@ export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOpti
   const sym = symbol.toUpperCase()
   const horizonDays = Math.max(1, Math.min(120, Math.round(opts.horizonDays ?? 10)))
   const errors: string[] = []
-  const notes: string[] = []
+  const notes: Text[] = []
 
   const [bars, chainStats, market] = await Promise.all([
     opts.bars?.length ? Promise.resolve(opts.bars) : loadBars(fetch, sym, opts.assetClass),
@@ -247,13 +248,23 @@ export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOpti
     if (e !== undefined && e >= 0 && e <= 9) {
       // An earnings report inside the front expiries lifts near-term IV: the
       // inverted term structure is the event being priced, not market stress.
-      om.flags.unshift(`Earnings in ${e} trading day${e === 1 ? '' : 's'}: near-term IV and the term structure price the report, not general stress.`)
+      om.flags.unshift(
+        bi(
+          `Earnings in ${e} trading day${e === 1 ? '' : 's'}: near-term IV and the term structure price the report, not general stress.`,
+          `${e} 个交易日后发布财报：近月 IV 与期限结构反映的是财报事件，而非整体市场压力。`,
+        ),
+      )
       om.confidence = +(om.confidence * 0.7).toFixed(2)
     }
     modules.push(om)
   }
   if (opts.earningsInDays !== undefined && opts.earningsInDays >= 0 && opts.earningsInDays <= horizonDays)
-    notes.push(`Earnings in ${opts.earningsInDays} trading days, inside the horizon: expect a gap that the levels and the model odds do not capture.`)
+    notes.push(
+      bi(
+        `Earnings in ${opts.earningsInDays} trading days, inside the horizon: expect a gap that the levels and the model odds do not capture.`,
+        `${opts.earningsInDays} 个交易日后发布财报，落在周期之内：可能出现跳空，关键位与模型概率都无法反映。`,
+      ),
+    )
   if (market.quotes.length) modules.push(slim(futuresModule({ quotes: market.quotes, cash: market.cash, cot: market.cot })))
 
   const comp = composite(modules, horizonDays, INDEX_LINKED.has(sym))
@@ -296,10 +307,14 @@ const sgn = (n: number, digits = 2) => `${n >= 0 ? '+' : ''}${n.toFixed(digits)}
 const pctOf = (n: number, digits = 1) => `${(n * 100).toFixed(digits)}%`
 const cell = (s: string) => s.replace(/\|/g, '\\|')
 const MODULE_NAME: Record<ModuleKey, string> = { trend: 'Trend', volatility: 'Volatility', volume: 'Volume / flow', options: 'Options', futures: 'Futures' }
+const MODULE_NAME_ZH: Record<ModuleKey, string> = { trend: '趋势', volatility: '波动率', volume: '成交量/资金流', options: '期权', futures: '期货' }
 
-export function moduleLabel(key: ModuleKey): string {
-  return MODULE_NAME[key]
+export function moduleLabel(key: ModuleKey, lang: Lang = 'en'): string {
+  return lang === 'zh' ? MODULE_NAME_ZH[key] : MODULE_NAME[key]
 }
+
+/** Tool answers are English: the 'en' side of a Text, or the value as it is. */
+const en = (t: Text | string | number | undefined) => pick('en', t)
 
 /** A −100..100 score as a ten-cell bar, e.g. "▁▁▁▁▁|███▁▁" (left of the bar = bearish). */
 export function scoreBar(score: number): string {
@@ -311,20 +326,20 @@ export function scoreBar(score: number): string {
 }
 
 function modulesMarkdown(modules: ModuleResult[], weights: Partial<Record<ModuleKey, number>>): string {
-  const rows = modules.map(m => `| ${MODULE_NAME[m.key]} | ${sgn(m.score, 0)} | ${m.confidence.toFixed(2)} | ${weights[m.key]?.toFixed(2) ?? '0'} | ${cell(m.verdict)} |`)
+  const rows = modules.map(m => `| ${MODULE_NAME[m.key]} | ${sgn(m.score, 0)} | ${m.confidence.toFixed(2)} | ${weights[m.key]?.toFixed(2) ?? '0'} | ${cell(en(m.verdict))} |`)
 
   return `| Module | Score | Confidence | Weight used | Verdict |\n|---|---|---|---|---|\n${rows.join('\n')}`
 }
 
 function readingsMarkdown(m: ModuleResult): string {
-  const lines = m.readings.map(r => `- ${r.name}: ${typeof r.value === 'number' ? +r.value.toFixed(4) : r.value}${r.note ? ` (${r.note})` : ''}`)
-  const flags = m.flags.map(f => `- ⚑ ${f}`)
+  const lines = m.readings.map(r => `- ${en(r.name)}: ${typeof r.value === 'number' ? +r.value.toFixed(4) : en(r.value)}${r.note && r.note.en ? ` (${r.note.en})` : ''}`)
+  const flags = m.flags.map(f => `- ⚑ ${en(f)}`)
 
-  return [`**${MODULE_NAME[m.key]}** ${sgn(m.score, 0)} · confidence ${m.confidence.toFixed(2)} — ${m.verdict}`, ...lines, ...flags].join('\n')
+  return [`**${MODULE_NAME[m.key]}** ${sgn(m.score, 0)} · confidence ${m.confidence.toFixed(2)} — ${en(m.verdict)}`, ...lines, ...flags].join('\n')
 }
 
 function analogsMarkdown(a: AnalogStudy): string {
-  if (!a.ok) return `Historical analogs: ${a.note}`
+  if (!a.ok) return `Historical analogs: ${en(a.note)}`
   const rows = a.horizons.map(
     h =>
       `| ${h.days} days | ${h.analogs.n} | ${h.analogs.winRate.toFixed(0)}% | ${sgn(h.analogs.mean)}% | ${sgn(h.analogs.median)}% | ${sgn(h.analogs.p10)}% / ${sgn(h.analogs.p90)}% | ${h.baseline.winRate.toFixed(0)}% | ${sgn(h.baseline.mean)}% |`,
@@ -333,7 +348,7 @@ function analogsMarkdown(a: AnalogStudy): string {
   return (
     `Historical analogs (${a.k} closest past days by trend, momentum, volatility and volume features, ${a.eligibleDays} days searched):\n\n` +
     `| Horizon | n | Win rate | Mean | Median | p10 / p90 | Baseline win | Baseline mean |\n|---|---|---|---|---|---|---|---|\n${rows.join('\n')}\n\n` +
-    `Closest analog dates: ${a.closest.map(c => c.date).join(', ')}. ${a.note}`
+    `Closest analog dates: ${a.closest.map(c => c.date).join(', ')}. ${en(a.note)}`
   )
 }
 
@@ -352,7 +367,7 @@ function optionsMarkdown(o: OptionsSummary): string {
   ]
   if (o.unusual.length)
     lines.push(`- Unusual volume: ${o.unusual.map(u => `${u.expiry} ${fmtPrice(u.strike)}${u.type} vol ${u.volume.toLocaleString('en-US')} vs OI ${u.oi.toLocaleString('en-US')} (~$${(u.premium / 1e6).toFixed(2)}M)`).join('; ')}`)
-  lines.push(`- ${o.gexNote}`)
+  lines.push(`- ${en(o.gexNote)}`)
 
   return lines.join('\n')
 }
@@ -360,12 +375,12 @@ function optionsMarkdown(o: OptionsSummary): string {
 export function reportMarkdown(r: Report): string {
   const c = r.composite
   const lvl = (l: LevelPoint) => `${fmtPrice(l.price)} (${l.kind}${l.date ? ` ${l.date}` : ''}, ${sgn(((l.price - r.spot) / r.spot) * 100, 1)}%)`
-  const moves = r.moves.map(m => `| ${m.label} | ±${m.pct1.toFixed(2)}% | ${fmtPrice(m.lower1)}–${fmtPrice(m.upper1)} | ${fmtPrice(m.lower2)}–${fmtPrice(m.upper2)} |`)
+  const moves = r.moves.map(m => `| ${en(m.label)} | ±${m.pct1.toFixed(2)}% | ${fmtPrice(m.lower1)}–${fmtPrice(m.upper1)} | ${fmtPrice(m.lower2)}–${fmtPrice(m.upper2)} |`)
   const scen = r.scenarios.rows.map(s => {
     const where = s.target !== undefined ? fmtPrice(s.target) : s.range ? `${fmtPrice(s.range[0])}–${fmtPrice(s.range[1])}` : '—'
     const mv = Array.isArray(s.movePct) ? `${sgn(s.movePct[0], 1)}% / ${sgn(s.movePct[1], 1)}%` : `${sgn(s.movePct, 1)}%`
 
-    return `| ${s.name} | ${where} | ${mv} | ${(s.probability * 100).toFixed(0)}% ${s.probKind} | ${cell(s.trigger)} | ${cell(s.invalidation)} |`
+    return `| ${s.name} | ${where} | ${mv} | ${(s.probability * 100).toFixed(0)}% ${s.probKind} | ${cell(en(s.trigger))} | ${cell(en(s.invalidation))} |`
   })
 
   return [
@@ -376,9 +391,9 @@ export function reportMarkdown(r: Report): string {
     `Key levels — resistance: ${r.resistances.map(lvl).join('; ') || 'none above'}\nsupport: ${r.supports.map(lvl).join('; ') || 'none below'}`,
     r.options ? optionsMarkdown(r.options) : 'Options: no chain (not optionable, or the source failed).',
     `Expected moves (lognormal, σ ${pctOf(r.sigma)}):\n\n| Horizon | 1σ | 1σ range | 2σ range |\n|---|---|---|---|\n${moves.join('\n')}`,
-    `Scenarios over ${r.scenarios.days} sessions (model probabilities, not direction calls):\n\n| Case | Target | Move | Probability | Trigger | Invalidation |\n|---|---|---|---|---|---|\n${scen.join('\n')}\n\n${r.scenarios.note}`,
+    `Scenarios over ${r.scenarios.days} sessions (model probabilities, not direction calls):\n\n| Case | Target | Move | Probability | Trigger | Invalidation |\n|---|---|---|---|---|---|\n${scen.join('\n')}\n\n${en(r.scenarios.note)}`,
     analogsMarkdown(r.analogs),
-    ...r.notes.map(n => `⚠ ${n}`),
+    ...r.notes.map(n => `⚠ ${en(n)}`),
     r.errors.length ? `Data gaps: ${r.errors.join('; ')}` : 'All sources answered.',
   ].join('\n\n')
 }

@@ -6,15 +6,19 @@ import { analyze, RANGE_BARS } from './analysis'
 import type { Analysis, Tone } from './analysis'
 import { candleChart, MA_COLORS } from './chart'
 import { isIncident, loadCalendar, loadTicker, marketToday } from './data'
-import { buildEvents, CATEGORY, parseMyEvent } from './events'
+import { buildEvents, CATEGORY, categoryLabel, myEventHint, parseMyEvent } from './events'
 import type { CalEvent } from './events'
 import { levelRows, sessionsMarkdown, statRows } from './levels'
 import type { Row } from './levels'
 import { betaMarkdown, buildBetaMap, buildMarket, buildOptions, buildProbabilities, buildReport, loadMarketContext, marketMarkdown, moduleLabel, optionsReportMarkdown, probabilitiesMarkdown, reportMarkdown, scoreBar } from './engine/report'
 import type { MarketContext, Report } from './engine/report'
-import { fmtPrice } from './engine/technicals'
+import { skewReadText } from './engine/options'
+import type { SkewRead } from './engine/options'
+import { fmtPrice, levelKindText } from './engine/technicals'
+import { agoText, biasText, dayLabel as dayLabelIn, etTime, LANGS, pick, relativeDays, tr } from './i18n'
+import type { Lang } from './i18n'
 import { chartPage } from './page'
-import { applyCommand, EMPTY_PORTFOLIO, parseCommand, RULE_LABELS, runChecks, sizePosition, valuePortfolio } from './portfolio'
+import { applyCommand, EMPTY_PORTFOLIO, parseCommand, RULE_LABELS, ruleText as ruleTextIn, runChecks, sizePosition, valuePortfolio } from './portfolio'
 
 const PANE = 'stock-desk'
 const CHART = 'stock-desk-chart'
@@ -23,11 +27,11 @@ const PORT = 'stock-desk-portfolio'
 const TICKER_TTL = 5 * 60_000
 const REPORT_TTL = 10 * 60_000
 const MARKET_TTL = 2 * 60_000
-const HORIZONS_DAYS: [number, string][] = [
-  [5, '1 week'],
-  [10, '2 weeks'],
-  [21, '1 month'],
-  [63, '3 months'],
+const HORIZONS_DAYS: [number, string, string][] = [
+  [5, '1 week', '1 周'],
+  [10, '2 weeks', '2 周'],
+  [21, '1 month', '1 个月'],
+  [63, '3 months', '3 个月'],
 ]
 const CALENDAR_TTL = 6 * 3600_000
 const ALL_CATEGORIES: CalCategory[] = ['watchlist', 'big-earnings', 'economy', 'fed', 'politics', 'market', 'mine']
@@ -55,7 +59,8 @@ const myEvents = atom({ plugin: 'stock-desk', key: 'myEvents' } as const, [], { 
 const portfolio = atom({ plugin: 'stock-desk', key: 'portfolio' } as const, EMPTY_PORTFOLIO, { shape: 'portfolio-1' })
 const sizer = atom({ plugin: 'stock-desk', key: 'sizer' } as const, '')
 const busy = atom({ plugin: 'stock-desk', key: 'busy' } as const, [])
-const reports = atom({ plugin: 'stock-desk', key: 'reports' } as const, {}, { shape: 'reports-1' })
+// reports-2: verdicts, readings, flags and scenario text are { en, zh } pairs.
+const reports = atom({ plugin: 'stock-desk', key: 'reports' } as const, {}, { shape: 'reports-2' })
 const reportErrors = atom({ plugin: 'stock-desk', key: 'reportErrors' } as const, {})
 
 type $ = EngineInterface
@@ -68,32 +73,29 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 const TONE_COLOR: Record<Tone, 'success' | 'subtle' | 'warning' | 'error'> = { good: 'success', info: 'subtle', warn: 'warning', risk: 'error' }
 const TONE_MARK: Record<Tone, string> = { good: '●', info: '○', warn: '▲', risk: '■' }
 const STARS = { 1: '★', 2: '★★', 3: '★★★' } as const
-const HORIZONS: [Horizon, string][] = [
-  [14, '2 weeks'],
-  [30, '1 month'],
-  [90, '3 months'],
+const HORIZONS: [Horizon, string, string][] = [
+  [14, '2 weeks', '2 周'],
+  [30, '1 month', '1 个月'],
+  [90, '3 months', '3 个月'],
 ]
 
-function ago(ms: number): string {
-  const s = Math.round((Date.now() - ms) / 1000)
-  if (s < 60) return 'just now'
-  if (s < 3600) return `${Math.round(s / 60)} min ago`
+const langOf = (p: Prefs): Lang => p.lang ?? 'en'
+const langNow = async ($: $): Promise<Lang> => langOf(await read($, prefs))
 
-  return `${Math.round(s / 3600)} h ago`
+function ago(ms: number, lang: Lang = 'en'): string {
+  return agoText(lang, ms)
 }
 
 function daysBetween(fromIso: string, toIso: string): number {
   return Math.round((Date.parse(`${toIso}T12:00:00Z`) - Date.parse(`${fromIso}T12:00:00Z`)) / 86_400_000)
 }
 
-function dayLabel(iso: string): string {
-  return new Date(`${iso}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' })
+function dayLabel(iso: string, lang: Lang = 'en'): string {
+  return dayLabelIn(lang, iso)
 }
 
-function relative(today: string, iso: string): string {
-  const d = daysBetween(today, iso)
-
-  return d === 0 ? 'today' : d === 1 ? 'tomorrow' : `in ${d} days`
+function relative(today: string, iso: string, lang: Lang = 'en'): string {
+  return relativeDays(lang, daysBetween(today, iso))
 }
 
 function nextEarnings(cal: Calendar, symbol: string): EarningsRow | undefined {
@@ -115,6 +117,46 @@ const fetcher = ($: $) => (url: string, init?: Parameters<$['http']['fetch']>[1]
 async function setPrefs($: $, fn: (p: Prefs) => Prefs): Promise<void> {
   const next = await update($, prefs, fn)
   await $.store.set('prefs', next)
+}
+
+// A failed source is reported as "<source>: <technical detail>"; in Chinese
+// only the source is named, in Chinese (the detail is an English server or
+// parser message, and the English view keeps it).
+const SOURCE_ZH: [RegExp, string][] = [
+  [/^Options chain$/, '期权链'],
+  [/^Futures quotes$/, '期货报价'],
+  [/^Cash indexes$/, '现货指数'],
+  [/^COT (\w+)$/, 'COT 持仓 $1'],
+  [/^VIX indexes$/, 'VIX 系列指数'],
+  [/^SPY report$/, 'SPY 分析'],
+]
+
+function sourceError(err: string, lang: Lang): string {
+  if (lang === 'en') return err
+  const i = err.indexOf(': ')
+  const source = i > 0 ? err.slice(0, i) : err
+  const detail = i > 0 ? err.slice(i + 2) : ''
+  const hit = SOURCE_ZH.find(([re]) => re.test(source))
+
+  return hit ? source.replace(hit[0], hit[1]) : `${source}${detail ? '（来源报错）' : ''}`
+}
+
+/** A calendar category's label in the language asked. */
+function catLabel(c: CalCategory, lang: Lang): string {
+  return categoryLabel(c, lang)
+}
+
+/** A portfolio rule's input label and explanation in the language asked. */
+function ruleText(r: (typeof RULE_LABELS)[number], lang: Lang): { title: string; meaning: string } {
+  const t = ruleTextIn(r, lang)
+
+  return { title: tr(lang, `${t.label} (${t.unit})`, `${t.label}（${t.unit}）`), meaning: t.meaning }
+}
+
+/** Switches English ↔ 中文 for every pane; the main pane's title follows at once. */
+async function switchLang($: $): Promise<void> {
+  await setPrefs($, p => ({ ...p, lang: langOf(p) === 'zh' ? 'en' : 'zh' }))
+  await $.ui.open({ id: PANE, title: tr(await langNow($), 'Stocks', '股票'), columns: 100 })
 }
 
 async function setMyEvents($: $, fn: (list: MyEvent[]) => MyEvent[]): Promise<void> {
@@ -142,9 +184,10 @@ async function refreshTicker($: $, symbol: string, force = false): Promise<void>
     await update($, tickers, all => ({ ...all, [symbol]: data }))
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    const lang = await langNow($)
     const failed: TickerData = have
-      ? { ...have, error: `Refresh failed (${message}); showing data from ${ago(have.fetchedAt)}` }
-      : { symbol, name: symbol, assetClass: 'stocks', bars: [], summary: {}, news: [], fetchedAt: Date.now(), error: `Could not load ${symbol}: ${message}` }
+      ? { ...have, error: tr(lang, `Refresh failed (${message}); showing data from ${ago(have.fetchedAt, lang)}`, `刷新失败（${message}），显示的是${ago(have.fetchedAt, lang)}的数据`) }
+      : { symbol, name: symbol, assetClass: 'stocks', bars: [], summary: {}, news: [], fetchedAt: Date.now(), error: tr(lang, `Could not load ${symbol}: ${message}`, `无法加载 ${symbol}：${message}`) }
     await update($, tickers, all => ({ ...all, [symbol]: failed }))
   } finally {
     await update($, busy, list => list.filter(s => s !== symbol))
@@ -160,7 +203,8 @@ async function refreshCalendar($: $, force = false): Promise<void> {
     const cal = await loadCalendar(fetcher($))
     await update($, calendar, () => cal)
   } catch (error) {
-    await update($, calendar, c => ({ ...c, error: `Calendar failed: ${error instanceof Error ? error.message : String(error)}` }))
+    const lang = await langNow($)
+    await update($, calendar, c => ({ ...c, error: tr(lang, 'Calendar failed: ', '日历加载失败：') + (error instanceof Error ? error.message : String(error)) }))
   } finally {
     await update($, busy, list => list.filter(s => s !== '#calendar'))
   }
@@ -305,7 +349,7 @@ async function createGroup($: $, text: string): Promise<void> {
   const symbols = parseSymbols(rest)
   const p = await read($, prefs)
   if (p.groups.some(g => g.name.toLowerCase() === name.toLowerCase())) {
-    await $.ui.toast(`There is already a group named ${name}.`)
+    await $.ui.toast(tr(langOf(p), `There is already a group named ${name}.`, `已经有名为 ${name} 的分组。`))
     return
   }
   await setPrefs($, x => ({
@@ -323,7 +367,7 @@ async function renameGroup($: $, text: string): Promise<void> {
   const p = await read($, prefs)
   if (!name || !activeGroup(p) || name === p.group) return
   if (p.groups.some(g => g.name.toLowerCase() === name.toLowerCase() && g.name !== p.group)) {
-    await $.ui.toast(`There is already a group named ${name}.`)
+    await $.ui.toast(tr(langOf(p), `There is already a group named ${name}.`, `已经有名为 ${name} 的分组。`))
     return
   }
   await setPrefs($, x => ({ ...x, groups: x.groups.map(g => (g.name === x.group ? { ...g, name } : g)), group: name }))
@@ -354,7 +398,7 @@ async function toggleMember($: $, name: string, symbol: string): Promise<void> {
 }
 
 async function openMain($: $): Promise<void> {
-  await $.ui.open({ id: PANE, title: 'Stocks', columns: 100 })
+  await $.ui.open({ id: PANE, title: tr(await langNow($), 'Stocks', '股票'), columns: 100 })
   const p = await read($, prefs)
   await Promise.all([p.selected ? refreshTicker($, p.selected) : undefined, refreshCalendar($)])
   await refreshShownReport($)
@@ -362,32 +406,33 @@ async function openMain($: $): Promise<void> {
 
 async function openChart($: $): Promise<void> {
   const p = await read($, prefs)
-  await $.ui.open({ id: CHART, title: `${p.selected} chart`, focus: true, closeOnEscape: true, columns: 220, rows: 60 })
+  await $.ui.open({ id: CHART, title: tr(langOf(p), `${p.selected} chart`, `${p.selected} K 线图`), focus: true, closeOnEscape: true, columns: 220, rows: 60 })
 }
 
 async function openCalendar($: $): Promise<void> {
-  await $.ui.open({ id: CAL, title: 'Market calendar', columns: 120, rows: 50 })
+  await $.ui.open({ id: CAL, title: tr(await langNow($), 'Market calendar', '市场日历'), columns: 120, rows: 50 })
   const p = await read($, prefs)
   // Each stock's dividend dates come with its quote.
   await Promise.all([refreshCalendar($), ...followed(p, await read($, portfolio)).map(s => refreshTicker($, s))])
 }
 
 async function openPortfolio($: $): Promise<void> {
-  await $.ui.open({ id: PORT, title: 'My portfolio', columns: 120, rows: 50 })
+  await $.ui.open({ id: PORT, title: tr(await langNow($), 'My portfolio', '我的持仓'), columns: 120, rows: 50 })
   const pf = await read($, portfolio)
   await Promise.all([refreshCalendar($), ...pf.positions.map(x => refreshTicker($, x.symbol))])
 }
 
 async function enterTrade($: $, text: string): Promise<void> {
   const command = parseCommand(text)
+  const lang = await langNow($)
   if (!command) {
-    await $.ui.toast('Try "NVDA 50 @ 120.5 stop 110", "sell NVDA 10 @ 140" or "cash 5000".')
+    await $.ui.toast(tr(lang, 'Try "NVDA 50 @ 120.5 stop 110", "sell NVDA 10 @ 140" or "cash 5000".', '试试 "NVDA 50 @ 120.5 stop 110"、"sell NVDA 10 @ 140" 或 "cash 5000"。'))
 
     return
   }
   let message = ''
   await setPortfolio($, pf => {
-    const out = applyCommand(pf, command, marketToday())
+    const out = applyCommand(pf, command, marketToday(), lang)
     message = out.message
 
     return out.pf
@@ -399,13 +444,14 @@ async function enterTrade($: $, text: string): Promise<void> {
 async function editPosition($: $, symbol: string, field: 'shares' | 'cost' | 'stop' | 'target' | 'note', value: string): Promise<void> {
   const text = value.trim().replace(/[$,]/g, '')
   const n = Number(text)
+  const lang = await langNow($)
   if ((field === 'shares' || field === 'cost') && !(n > 0)) {
-    await $.ui.toast(`${field === 'shares' ? 'Shares' : 'Average cost'} must be a number above 0.`)
+    await $.ui.toast(tr(lang, `${field === 'shares' ? 'Shares' : 'Average cost'} must be a number above 0.`, `${field === 'shares' ? '股数' : '平均成本'}必须是大于 0 的数字。`))
 
     return
   }
   if ((field === 'stop' || field === 'target') && text !== '' && !(n > 0)) {
-    await $.ui.toast('Enter a price, or leave it empty to clear it.')
+    await $.ui.toast(tr(lang, 'Enter a price, or leave it empty to clear it.', '请输入价格，留空则清除。'))
 
     return
   }
@@ -424,7 +470,7 @@ async function editPosition($: $, symbol: string, field: 'shares' | 'cost' | 'st
 async function setRule($: $, key: keyof Rules, value: string): Promise<void> {
   const n = Number(value.trim().replace(/%/g, ''))
   if (!(n > 0)) {
-    await $.ui.toast('Enter a number above 0.')
+    await $.ui.toast(tr(await langNow($), 'Enter a number above 0.', '请输入大于 0 的数字。'))
 
     return
   }
@@ -434,30 +480,31 @@ async function setRule($: $, key: keyof Rules, value: string): Promise<void> {
 /** Writes the chart as a page and opens it in the default browser, where it can go full screen. */
 async function openInBrowser($: $): Promise<void> {
   const p = await read($, prefs)
+  const lang = langOf(p)
   const data = (await read($, tickers))[p.selected]
-  const a = data ? analyze(data.bars, p.bigRange) : undefined
+  const a = data ? analyze(data.bars, p.bigRange, undefined, lang) : undefined
   if (!data || !a) {
-    await $.ui.toast('No chart data yet.')
+    await $.ui.toast(tr(lang, 'No chart data yet.', '还没有图表数据。'))
 
     return
   }
   const from = Math.max(0, data.bars.length - RANGE_BARS[p.bigRange])
-  const svg = candleChart({ bars: data.bars, from, a, width: 1500, height: 760, colors: p.colors })
-  const html = chartPage({ data, a, svg, levels: levelRows(a, p.bigRange), stats: statRows(a, data), range: p.bigRange })
+  const svg = candleChart({ bars: data.bars, from, a, width: 1500, height: 760, colors: p.colors, lang })
+  const html = chartPage({ data, a, svg, levels: levelRows(a, p.bigRange, lang), stats: statRows(a, data, lang), range: p.bigRange, lang })
   const path = `/tmp/stock-desk-${data.symbol}.html`
   try {
     await $.fs.write(path, html)
     const run = await $.process.run(['open', path])
-    await $.ui.toast(run.exitCode === 0 ? `Opened ${data.symbol} in your browser.` : `Saved the chart to ${path}`)
+    await $.ui.toast(run.exitCode === 0 ? tr(lang, `Opened ${data.symbol} in your browser.`, `已在浏览器中打开 ${data.symbol}。`) : tr(lang, `Saved the chart to ${path}`, `图表已保存到 ${path}`))
   } catch (error) {
-    await $.ui.toast(`Could not open the chart: ${error instanceof Error ? error.message : String(error)}`)
+    await $.ui.toast(tr(lang, 'Could not open the chart: ', '无法打开图表：') + (error instanceof Error ? error.message : String(error)))
   }
 }
 
 async function addMyEvent($: $, text: string): Promise<void> {
   const parsed = parseMyEvent(text, marketToday())
   if (!parsed) {
-    await $.ui.toast('Start with a date: 2026-11-20 Nvidia GTC, 11/20 Nvidia GTC or Nov 20 Nvidia GTC')
+    await $.ui.toast(myEventHint(await langNow($)))
 
     return
   }
@@ -755,6 +802,8 @@ export const register: Register = on => {
     const Input = e.surface !== 'mobile' && 'Input' in t ? t.Input : undefined
     const Svg = e.surface !== 'terminal' && 'Svg' in t ? t.Svg : undefined
     const p = await read($, prefs)
+    const lang = langOf(p)
+    const L = (en: string, zh: string) => tr(lang, en, zh)
     const all = await read($, tickers)
     const cal = await read($, calendar)
     const loading = await read($, busy)
@@ -762,7 +811,7 @@ export const register: Register = on => {
     const data = p.selected ? all[p.selected] : undefined
     const today = marketToday()
     const earnings = p.selected ? nextEarnings(cal, p.selected) : undefined
-    const a: Analysis | undefined = data ? analyze(data.bars, p.range, earnings ? daysBetween(today, earnings.date) : undefined) : undefined
+    const a: Analysis | undefined = data ? analyze(data.bars, p.range, earnings ? daysBetween(today, earnings.date) : undefined, lang) : undefined
     const newsAlerts = data?.news.filter(n => isIncident(n.title)).length ?? 0
 
     /** Rows whose underlined names show what they mean on hover. */
@@ -808,37 +857,37 @@ export const register: Register = on => {
     // Group tabs: All, each group, and the switch for the group tools.
     const groupTabs = (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        {[{ name: '', label: 'All', count: p.watchlist.length }, ...p.groups.map(g => ({ name: g.name, label: g.name, count: g.symbols.length }))].map((g, i) => (
+        {[{ name: '', label: L('All', '全部'), count: p.watchlist.length }, ...p.groups.map(g => ({ name: g.name, label: g.name, count: g.symbols.length }))].map((g, i) => (
           <Button key={i === 0 ? 'group-all' : `group-${i - 1}`} plain={p.group === g.name ? undefined : true} variant={p.group === g.name ? 'primary' : undefined} onPress={() => void selectGroup($, g.name)}>
             {g.label} <Text dimColor>{g.count}</Text>
           </Button>
         ))}
         <Button key="manage-groups" plain dimColor={p.manageGroups ? undefined : true} onPress={() => void setPrefs($, x => ({ ...x, manageGroups: !x.manageGroups }))}>
-          {p.manageGroups ? 'Done' : p.groups.length ? '⚙ Groups' : '+ Group'}
+          {p.manageGroups ? L('Done', '完成') : p.groups.length ? L('⚙ Groups', '⚙ 分组') : L('+ Group', '+ 分组')}
         </Button>
       </Box>
     )
 
     const groupTools = p.manageGroups && (
       <Box flexDirection="column" gap={1} paddingX={1} borderStyle="round" borderColor="#3b4048">
-        {Input && <Input key="new-group" placeholder="New group, e.g. Chips: NVDA AMD TSM" submitLabel="Create" onSubmit={value => void createGroup($, value)} />}
+        {Input && <Input key="new-group" placeholder={L('New group, e.g. Chips: NVDA AMD TSM', '新分组，例如 芯片: NVDA AMD TSM')} submitLabel={L('Create', '创建')} onSubmit={value => void createGroup($, value)} />}
         {group && (
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
-            {Input && <Input key="rename-group" label="Rename" value={group.name} submitLabel="Rename" onSubmit={value => void renameGroup($, value)} />}
+            {Input && <Input key="rename-group" label={L('Rename', '重命名')} value={group.name} submitLabel={L('Rename', '重命名')} onSubmit={value => void renameGroup($, value)} />}
             <Button key="group-left" plain onPress={() => void moveGroup($, -1)}>
-              ← Move
+              {L('← Move', '← 左移')}
             </Button>
             <Button key="group-right" plain onPress={() => void moveGroup($, 1)}>
-              Move →
+              {L('Move →', '右移 →')}
             </Button>
             <Button key="delete-group" plain dimColor onPress={() => void deleteGroup($)}>
-              Delete group {group.name}
+              {L(`Delete group ${group.name}`, `删除分组 ${group.name}`)}
             </Button>
           </Box>
         )}
         {p.selected && p.groups.length > 0 && (
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
-            <Text>{p.selected} is in:</Text>
+            <Text>{L(`${p.selected} is in:`, `${p.selected} 所在分组：`)}</Text>
             {p.groups.map((g, i) => {
               const isIn = g.symbols.includes(p.selected)
 
@@ -851,7 +900,10 @@ export const register: Register = on => {
           </Box>
         )}
         <Text dimColor size="footnote">
-          A stock can be in several groups. Tickers added while a group is open go into it too. Deleting a group, or removing a stock from one, keeps the stock in All.
+          {L(
+            'A stock can be in several groups. Tickers added while a group is open go into it too. Deleting a group, or removing a stock from one, keeps the stock in All.',
+            '一只股票可以属于多个分组。打开某个分组时添加的代码也会放进该分组。删除分组或从分组中移除股票，股票仍保留在“全部”里。',
+          )}
         </Text>
       </Box>
     )
@@ -861,7 +913,13 @@ export const register: Register = on => {
         {groupTabs}
         {groupTools}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          {list.length === 0 && <Text dimColor>{group ? `No stocks in ${group.name} yet. Add tickers below, or pick a stock in All and use ⚙ Groups to put it here.` : 'No stocks yet.'}</Text>}
+          {list.length === 0 && (
+            <Text dimColor>
+              {group
+                ? L(`No stocks in ${group.name} yet. Add tickers below, or pick a stock in All and use ⚙ Groups to put it here.`, `${group.name} 里还没有股票。在下方添加代码，或在“全部”里选中一只股票，用 ⚙ 分组 放进来。`)
+                : L('No stocks yet.', '还没有股票。')}
+            </Text>
+          )}
           {list.map(sym => {
             const q = all[sym]?.quote
 
@@ -877,7 +935,7 @@ export const register: Register = on => {
     )
 
     const addField = Input && (
-      <Input key="add" placeholder={group ? `Add tickers to ${group.name}, e.g. TSLA AMD` : 'Add tickers, e.g. TSLA AMD'} submitLabel="Add" onSubmit={value => void addSymbols($, value)} />
+      <Input key="add" placeholder={group ? L(`Add tickers to ${group.name}, e.g. TSLA AMD`, `向 ${group.name} 添加代码，例如 TSLA AMD`) : L('Add tickers, e.g. TSLA AMD', '添加代码，例如 TSLA AMD')} submitLabel={L('Add', '添加')} onSubmit={value => void addSymbols($, value)} />
     )
 
     if (!p.selected || !data) {
@@ -885,7 +943,7 @@ export const register: Register = on => {
         <Box flexDirection="column" gap={1}>
           {watchlist}
           {addField}
-          <Text dimColor>{p.selected ? `Loading ${p.selected}…` : 'Add a ticker to start.'}</Text>
+          <Text dimColor>{p.selected ? L(`Loading ${p.selected}…`, `正在加载 ${p.selected}…`) : L('Add a ticker to start.', '添加一个代码开始。')}</Text>
         </Box>
       )
     }
@@ -904,7 +962,7 @@ export const register: Register = on => {
           </Text>
         )}
         <Text dimColor size="footnote">
-          {q ? `${q.asOf} · ${q.marketStatus || 'Market'} · 15-min delayed` : ''}
+          {q ? `${q.asOf} · ${q.marketStatus || L('Market', '市场')} · ${L('15-min delayed', '延迟约 15 分钟')}` : ''}
           {q?.extended ? ` · ${q.extended.label}: ${money(q.extended.price)} (${signed(q.extended.changePct)}%)` : ''}
         </Text>
         {a && (
@@ -921,10 +979,10 @@ export const register: Register = on => {
       <Box flexDirection="row" gap={1}>
         {(
           [
-            ['analysis', 'Analysis'],
-            ['overview', 'Chart & levels'],
-            ['news', newsAlerts ? `News · ${newsAlerts} alert${newsAlerts === 1 ? '' : 's'}` : 'News'],
-            ['calendar', 'Calendar'],
+            ['analysis', L('Analysis', '分析')],
+            ['overview', L('Chart & levels', 'K 线与关键价位')],
+            ['news', newsAlerts ? L(`News · ${newsAlerts} alert${newsAlerts === 1 ? '' : 's'}`, `新闻 · ${newsAlerts} 条提醒`) : L('News', '新闻')],
+            ['calendar', L('Calendar', '日历')],
           ] as [Tab, string][]
         ).map(([tab, label]) => (
           <Button key={`tab-${tab}`} plain={p.tab === tab ? undefined : true} variant={p.tab === tab ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, tab })).then(() => refreshShownReport($))}>
@@ -945,14 +1003,14 @@ export const register: Register = on => {
 
       const horizonRow = (
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          <Text dimColor>Horizon:</Text>
-          {HORIZONS_DAYS.map(([days, label]) => (
+          <Text dimColor>{L('Horizon:', '周期：')}</Text>
+          {HORIZONS_DAYS.map(([days, en, zh]) => (
             <Button key={`hz-${days}`} plain={horizon === days ? undefined : true} variant={horizon === days ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, horizon: days })).then(() => refreshShownReport($))}>
-              {label}
+              {L(en, zh)}
             </Button>
           ))}
           <Button key="report-refresh" plain onPress={() => void refreshShownReport($, true)}>
-            {working ? 'Analysing…' : 'Re-run analysis'}
+            {working ? L('Analysing…', '分析中…') : L('Re-run analysis', '重新分析')}
           </Button>
         </Box>
       )
@@ -962,10 +1020,15 @@ export const register: Register = on => {
           <Box flexDirection="column" gap={1}>
             {horizonRow}
             {failed && !working ? (
-              <Text color="warning">Analysis failed: {failed}</Text>
+              <Text color="warning">
+                {L('Analysis failed: ', '分析失败：')}
+                {failed}
+              </Text>
             ) : (
               <Text dimColor>
-                {working ? `Analysing ${data.symbol}: ten years of prices, the option chain, futures and positioning…` : 'Press Re-run analysis to analyse this ticker.'}
+                {working
+                  ? L(`Analysing ${data.symbol}: ten years of prices, the option chain, futures and positioning…`, `正在分析 ${data.symbol}：十年价格、期权链、期货与持仓…`)
+                  : L('Press Re-run analysis to analyse this ticker.', '点击“重新分析”来分析这个代码。')}
               </Text>
             )}
           </Box>
@@ -974,22 +1037,25 @@ export const register: Register = on => {
         const c = report.composite
         const o = report.options
         const levelRowsMd = [
-          ...report.resistances.map(l => ({ price: l.price, what: `Resistance · ${l.kind}${l.date ? ` ${l.date}` : ''}` })),
-          ...report.supports.map(l => ({ price: l.price, what: `Support · ${l.kind}${l.date ? ` ${l.date}` : ''}` })),
-          ...(o?.levels.callWall !== undefined ? [{ price: o.levels.callWall, what: 'Options · call wall (largest call gamma)' }] : []),
-          ...(o?.levels.putWall !== undefined ? [{ price: o.levels.putWall, what: 'Options · put wall (largest put gamma)' }] : []),
-          ...(o?.levels.gammaFlip !== undefined ? [{ price: o.levels.gammaFlip, what: 'Options · gamma flip (dealers short gamma below)' }] : []),
-          ...(o?.maxPainMonthly ? [{ price: o.maxPainMonthly.strike, what: `Options · max pain ${o.maxPainMonthly.expiry}` }] : []),
+          ...report.resistances.map(l => ({ price: l.price, what: `${L('Resistance', '阻力')} · ${pick(lang, levelKindText(l.kind))}${l.date ? ` ${l.date}` : ''}` })),
+          ...report.supports.map(l => ({ price: l.price, what: `${L('Support', '支撑')} · ${pick(lang, levelKindText(l.kind))}${l.date ? ` ${l.date}` : ''}` })),
+          ...(o?.levels.callWall !== undefined ? [{ price: o.levels.callWall, what: L('Options · call wall (largest call gamma)', '期权 · 看涨墙（call wall，看涨伽马最大）') }] : []),
+          ...(o?.levels.putWall !== undefined ? [{ price: o.levels.putWall, what: L('Options · put wall (largest put gamma)', '期权 · 看跌墙（put wall，看跌伽马最大）') }] : []),
+          ...(o?.levels.gammaFlip !== undefined ? [{ price: o.levels.gammaFlip, what: L('Options · gamma flip (dealers short gamma below)', '期权 · 伽马翻转点（gamma flip，其下做市商为负伽马）') }] : []),
+          ...(o?.maxPainMonthly ? [{ price: o.maxPainMonthly.strike, what: L(`Options · max pain ${o.maxPainMonthly.expiry}`, `期权 · 最大痛点（max pain）${o.maxPainMonthly.expiry}`) }] : []),
         ].sort((a, b) => b.price - a.price)
         const flags = report.modules.flatMap(m => m.flags.slice(0, 2).map(f => ({ key: m.key, f }))).slice(0, 8)
         const scen = report.scenarios.rows
           .map(sc => {
             const where = sc.target !== undefined ? fmtPrice(sc.target) : sc.range ? `${fmtPrice(sc.range[0])}–${fmtPrice(sc.range[1])}` : '—'
 
-            return `| **${sc.name}** | ${where} | ${(sc.probability * 100).toFixed(0)}% ${sc.probKind} | ${sc.trigger.replace(/\|/g, '/')} | ${sc.invalidation.replace(/\|/g, '/')} |`
+            const name = { bull: L('bull', '乐观'), base: L('base', '基准'), bear: L('bear', '悲观') }[sc.name]
+            const kind = sc.probKind === 'touch' ? L('touch', '触及') : L('finish inside', '收在区间内')
+
+            return `| **${name}** | ${where} | ${(sc.probability * 100).toFixed(0)}% ${kind} | ${pick(lang, sc.trigger).replace(/\|/g, '/')} | ${pick(lang, sc.invalidation).replace(/\|/g, '/')} |`
           })
           .join('\n')
-        const moves = report.moves.map(m => `| ${m.label} | ±${m.pct1.toFixed(2)}% | ${fmtPrice(m.lower1)}–${fmtPrice(m.upper1)} | ${fmtPrice(m.lower2)}–${fmtPrice(m.upper2)} |`).join('\n')
+        const moves = report.moves.map(m => `| ${pick(lang, m.label)} | ±${m.pct1.toFixed(2)}% | ${fmtPrice(m.lower1)}–${fmtPrice(m.upper1)} | ${fmtPrice(m.lower2)}–${fmtPrice(m.upper2)} |`).join('\n')
         const a = report.analogs
 
         body = (
@@ -997,18 +1063,22 @@ export const register: Register = on => {
             {horizonRow}
             <Box flexDirection="column">
               <Text size="title" weight="bold" color={scoreColor(c.score)}>
-                {c.bias.toUpperCase()} <Text tabular>{c.score >= 0 ? '+' : ''}{c.score}</Text>
+                {lang === 'zh' ? pick('zh', biasText(c.bias)) : c.bias.toUpperCase()} <Text tabular>{c.score >= 0 ? '+' : ''}{c.score}</Text>
               </Text>
               <Text>
-                Confidence {c.confidence.toFixed(2)} · {c.agree}/{c.total} modules agree · next {report.horizonDays} sessions
+                {L(
+                  `Confidence ${c.confidence.toFixed(2)} · ${c.agree}/${c.total} modules agree · next ${report.horizonDays} sessions`,
+                  `置信度 ${c.confidence.toFixed(2)} · ${c.agree}/${c.total} 个模块同向 · 未来 ${report.horizonDays} 个交易日`,
+                )}
               </Text>
               <Text dimColor size="footnote">
-                From the {report.asOf} close {fmtPrice(report.spot)}
-                {report.indicated ? ` · latest print ${fmtPrice(report.indicated.price)} (${pct(report.indicated.changePct, 2)})` : ''} · σ {(report.sigma * 100).toFixed(1)}% {report.sigmaSource} · analysed {ago(report.fetchedAt)}
+                {L(`From the ${report.asOf} close ${fmtPrice(report.spot)}`, `基于 ${report.asOf} 收盘价 ${fmtPrice(report.spot)}`)}
+                {report.indicated ? L(` · latest print ${fmtPrice(report.indicated.price)} (${pct(report.indicated.changePct, 2)})`, ` · 最新成交 ${fmtPrice(report.indicated.price)}（${pct(report.indicated.changePct, 2)}）`) : ''} · σ {(report.sigma * 100).toFixed(1)}%{' '}
+                {report.sigmaSource === 'implied' ? L('implied', '隐含') : L('realized', '已实现')} · {L('analysed', '分析于')} {ago(report.fetchedAt, lang)}
               </Text>
             </Box>
             <Text weight="semibold">
-              Modules <Text dimColor size="footnote">· hover a name for its readings</Text>
+              {L('Modules', '分析模块')} <Text dimColor size="footnote">{L('· hover a name for its readings', '· 悬停名称查看读数')}</Text>
             </Text>
             <Box flexDirection="column">
               {report.modules.map(m => {
@@ -1019,7 +1089,7 @@ export const register: Register = on => {
                     <Box flexDirection="row">
                       <Box width={16}>
                         <Text underline hover={{ scope, color: 'claude' }}>
-                          {moduleLabel(m.key)}
+                          {moduleLabel(m.key, lang)}
                         </Text>
                       </Box>
                       <Box width={14}>
@@ -1032,19 +1102,21 @@ export const register: Register = on => {
                         </Text>
                       </Box>
                       <Text dimColor tabular>
-                        conf {m.confidence.toFixed(2)} · weight {(c.weights[m.key] ?? 0).toFixed(2)}
+                        {L('conf', '置信')} {m.confidence.toFixed(2)} · {L('weight', '权重')} {(c.weights[m.key] ?? 0).toFixed(2)}
                       </Text>
                       <Box position="absolute" top={1} left={2} display="none" hover={{ scope, display: 'flex' }} flexDirection="column" width={Math.min(76, cols - 4)} paddingX={1} backgroundColor="#1f2328" borderStyle="round" borderColor="#3b4048">
                         {m.readings.map(r => (
                           <Text color="#f3f4f6">
-                            {r.name}: {typeof r.value === 'number' ? +r.value.toFixed(4) : r.value}
-                            {r.note ? <Text color="#9ca3af"> ({r.note})</Text> : ''}
+                            {pick(lang, r.name)}
+                            {L(': ', '：')}
+                            {typeof r.value === 'number' ? +r.value.toFixed(4) : pick(lang, r.value)}
+                            {r.note ? <Text color="#9ca3af">{L(` (${pick(lang, r.note)})`, `（${pick(lang, r.note)}）`)}</Text> : ''}
                           </Text>
                         ))}
                       </Box>
                     </Box>
                     <Box paddingLeft={2}>
-                      <Text dimColor>{m.verdict}</Text>
+                      <Text dimColor>{pick(lang, m.verdict)}</Text>
                     </Box>
                   </Box>
                 )
@@ -1052,49 +1124,61 @@ export const register: Register = on => {
             </Box>
             {flags.length > 0 && (
               <Box flexDirection="column">
-                <Text weight="semibold">What stands out</Text>
+                <Text weight="semibold">{L('What stands out', '值得注意')}</Text>
                 {flags.map(({ key, f }) => (
                   <Text>
                     <Text color="warning">▲ </Text>
-                    <Text dimColor>{moduleLabel(key)}:</Text> {f}
+                    <Text dimColor>
+                      {moduleLabel(key, lang)}
+                      {L(':', '：')}
+                    </Text>{' '}
+                    {pick(lang, f)}
                   </Text>
                 ))}
               </Box>
             )}
             {report.notes.map(n => (
-              <Text color="warning">⚠ {n}</Text>
+              <Text color="warning">⚠ {pick(lang, n)}</Text>
             ))}
-            <Text weight="semibold">Key levels</Text>
-            <Markdown text={`| Price | vs close | Level |\n|---|---|---|\n${levelRowsMd.map(l => `| ${fmtPrice(l.price)} | ${pct(((l.price - report.spot) / report.spot) * 100)} | ${l.what} |`).join('\n')}`} />
+            <Text weight="semibold">{L('Key levels', '关键价位')}</Text>
+            <Markdown text={`| ${L('Price', '价格')} | ${L('vs close', '较收盘')} | ${L('Level', '价位')} |\n|---|---|---|\n${levelRowsMd.map(l => `| ${fmtPrice(l.price)} | ${pct(((l.price - report.spot) / report.spot) * 100)} | ${l.what} |`).join('\n')}`} />
             {o && (
               <Text dimColor size="footnote">
-                Options: P/C volume {o.pcVolume?.toFixed(2) ?? '—'}, OI {o.pcOi?.toFixed(2) ?? '—'} · ATM IV 30d {o.ivAtm30 !== undefined ? `${(o.ivAtm30 * 100).toFixed(1)}%` : '—'} · 25Δ skew {o.skew ? `${(o.skew.skew * 100).toFixed(1)} pts (${o.skew.read})` : '—'} · straddle to {o.moves[0]?.expiry ?? '—'} ±{o.moves[0]?.pct.toFixed(2) ?? '—'}%
+                {L('Options: P/C volume ', '期权：P/C 成交量 ')}
+                {o.pcVolume?.toFixed(2) ?? '—'}
+                {L(', OI ', '，OI ')}
+                {o.pcOi?.toFixed(2) ?? '—'} · {L('ATM IV 30d', '平值 IV 30 日')} {o.ivAtm30 !== undefined ? `${(o.ivAtm30 * 100).toFixed(1)}%` : '—'} · {L('25Δ skew', '25Δ 偏斜')}{' '}
+                {o.skew ? L(`${(o.skew.skew * 100).toFixed(1)} pts (${pick('en', skewReadText(o.skew.read as SkewRead))})`, `${(o.skew.skew * 100).toFixed(1)} 个波动率点（${pick('zh', skewReadText(o.skew.read as SkewRead))}）`) : '—'} · {L('straddle to', '跨式组合至')} {o.moves[0]?.expiry ?? '—'} ±{o.moves[0]?.pct.toFixed(2) ?? '—'}%
               </Text>
             )}
             <Text weight="semibold">
-              Scenarios <Text dimColor size="footnote">· model odds from σ, not a direction call</Text>
+              {L('Scenarios', '情景')} <Text dimColor size="footnote">{L('· model odds from σ, not a direction call', '· 基于 σ 的模型概率，不是方向判断')}</Text>
             </Text>
-            <Markdown text={`| Case | Target | Odds | Trigger | Invalidation |\n|---|---|---|---|---|\n${scen}`} />
-            <Text weight="semibold">Expected moves</Text>
-            <Markdown text={`| Horizon | 1σ | 1σ range | 2σ range |\n|---|---|---|---|\n${moves}`} />
-            <Text weight="semibold">Historical analogs</Text>
+            <Markdown text={`| ${L('Case', '情景')} | ${L('Target', '目标')} | ${L('Odds', '概率')} | ${L('Trigger', '触发条件')} | ${L('Invalidation', '失效条件')} |\n|---|---|---|---|---|\n${scen}`} />
+            <Text weight="semibold">{L('Expected moves', '预期波幅')}</Text>
+            <Markdown text={`| ${L('Horizon', '周期')} | 1σ | ${L('1σ range', '1σ 区间')} | ${L('2σ range', '2σ 区间')} |\n|---|---|---|---|\n${moves}`} />
+            <Text weight="semibold">{L('Historical analogs', '历史相似样本')}</Text>
             {a.ok ? (
               <Box flexDirection="column">
                 <Markdown
-                  text={`| Horizon | Analog win | Mean | p10 / p90 | All days win | All days mean |\n|---|---|---|---|---|---|\n${a.horizons
-                    .map(h => `| ${h.days} days | ${h.analogs.winRate.toFixed(0)}% | ${pct(h.analogs.mean, 2)} | ${pct(h.analogs.p10)} / ${pct(h.analogs.p90)} | ${h.baseline.winRate.toFixed(0)}% | ${pct(h.baseline.mean, 2)} |`)
+                  text={`| ${L('Horizon', '周期')} | ${L('Analog win', '相似样本胜率')} | ${L('Mean', '均值')} | p10 / p90 | ${L('All days win', '全部交易日胜率')} | ${L('All days mean', '全部交易日均值')} |\n|---|---|---|---|---|---|\n${a.horizons
+                    .map(h => `| ${L(`${h.days} days`, `${h.days} 日`)} | ${h.analogs.winRate.toFixed(0)}% | ${pct(h.analogs.mean, 2)} | ${pct(h.analogs.p10)} / ${pct(h.analogs.p90)} | ${h.baseline.winRate.toFixed(0)}% | ${pct(h.baseline.mean, 2)} |`)
                     .join('\n')}`}
                 />
                 <Text dimColor size="footnote">
-                  The {a.k} past days most like today (trend, momentum, volatility, volume), from {a.eligibleDays} days; closest {a.closest.slice(0, 3).map(x => x.date).join(', ')}. Overlapping, small samples: context, not a forecast.
+                  {L(
+                    `The ${a.k} past days most like today (trend, momentum, volatility, volume), from ${a.eligibleDays} days; closest ${a.closest.slice(0, 3).map(x => x.date).join(', ')}. Overlapping, small samples: context, not a forecast.`,
+                    `从 ${a.eligibleDays} 个交易日中找出与今天最相似的 ${a.k} 天（趋势、动量、波动率、成交量）；最接近的是 ${a.closest.slice(0, 3).map(x => x.date).join('、')}。样本有重叠且数量少：仅作参考，不是预测。`,
+                  )}
                 </Text>
               </Box>
             ) : (
-              <Text dimColor>{a.note}</Text>
+              <Text dimColor>{pick(lang, a.note)}</Text>
             )}
             {report.errors.length > 0 && (
               <Text color="warning" size="footnote">
-                Data gaps: {report.errors.join('; ')}
+                {L('Data gaps: ', '数据缺失：')}
+                {report.errors.map(err => sourceError(err, lang)).join(L('; ', '；'))}
               </Text>
             )}
             <Button
@@ -1102,19 +1186,22 @@ export const register: Register = on => {
               variant="primary"
               onPress={() =>
                 void $.prompt.submit({
-                  text: `Use the stock-desk analyze skill to give me a full data-driven read on ${data.symbol} for the next ${report.horizonDays} trading days: bias and confidence, the readings behind it, key levels, scenarios, what would change the view, and the risks.`,
+                  text: L(
+                    `Use the stock-desk analyze skill to give me a full data-driven read on ${data.symbol} for the next ${report.horizonDays} trading days: bias and confidence, the readings behind it, key levels, scenarios, what would change the view, and the risks.`,
+                    `用 stock-desk analyze 技能，基于数据分析 ${data.symbol} 未来 ${report.horizonDays} 个交易日：倾向与置信度、背后的读数、关键价位、情景、什么会改变判断，以及风险。`,
+                  ),
                   asUser: true,
                 })
               }
             >
-              Ask Claude for a written read
+              {L('Ask Claude for a written read', '让 Claude 写一份解读')}
             </Button>
           </Box>
         )
       }
     } else if (p.tab === 'overview') {
       if (!a) {
-        body = <Text dimColor>No price history for {data.symbol}.</Text>
+        body = <Text dimColor>{L(`No price history for ${data.symbol}.`, `${data.symbol} 没有价格历史。`)}</Text>
       } else {
         const from = Math.max(0, data.bars.length - RANGE_BARS[p.range])
         const width = clamp(cols * 7.5, 320, 900)
@@ -1129,32 +1216,39 @@ export const register: Register = on => {
                 </Button>
               ))}
               <Button key="expand" onPress={() => void setPrefs($, x => ({ ...x, bigRange: x.range })).then(() => openChart($))}>
-                ⤢ Expand chart
+                {L('⤢ Expand chart', '⤢ 放大图表')}
               </Button>
               <Button key="browser" plain onPress={() => void setPrefs($, x => ({ ...x, bigRange: x.range })).then(() => openInBrowser($))}>
-                Open in browser (full screen)
+                {L('Open in browser (full screen)', '在浏览器中打开（全屏）')}
               </Button>
             </Box>
             {Svg ? (
               <Svg
-                source={candleChart({ bars: data.bars, from, a, width, colors: p.colors })}
-                alt={`${data.symbol} daily candlestick chart, ${p.range}: high ${money(a.rangeHigh.price)} on ${a.rangeHigh.date}, low ${money(a.rangeLow.price)} on ${a.rangeLow.date}, last close ${money(last)}`}
+                source={candleChart({ bars: data.bars, from, a, width, colors: p.colors, lang })}
+                alt={L(
+                  `${data.symbol} daily candlestick chart, ${p.range}: high ${money(a.rangeHigh.price)} on ${a.rangeHigh.date}, low ${money(a.rangeLow.price)} on ${a.rangeLow.date}, last close ${money(last)}`,
+                  `${data.symbol} 日 K 线图，${p.range}：最高 ${money(a.rangeHigh.price)}（${a.rangeHigh.date}），最低 ${money(a.rangeLow.price)}（${a.rangeLow.date}），最新收盘 ${money(last)}`,
+                )}
               />
             ) : (
               <Text dimColor>
-                The chart draws in the desktop app. {p.range}: high {money(a.rangeHigh.price)} ({a.rangeHigh.date}), low {money(a.rangeLow.price)} ({a.rangeLow.date}).
+                {L(
+                  `The chart draws in the desktop app. ${p.range}: high ${money(a.rangeHigh.price)} (${a.rangeHigh.date}), low ${money(a.rangeLow.price)} (${a.rangeLow.date}).`,
+                  `图表在桌面应用中显示。${p.range}：最高 ${money(a.rangeHigh.price)}（${a.rangeHigh.date}），最低 ${money(a.rangeLow.price)}（${a.rangeLow.date}）。`,
+                )}
               </Text>
             )}
             <Text dimColor size="footnote">
-              For each candle's open, high, low, close and volume, use ⤢ Expand chart or Open in browser. <Text color={MA_COLORS.ma20}>MA20</Text> · <Text color={MA_COLORS.ma50}>MA50</Text> · <Text color={MA_COLORS.ma200}>MA200</Text> · dashed lines are support and resistance.
+              {L("For each candle's open, high, low, close and volume, use ⤢ Expand chart or Open in browser. ", '要查看每根 K 线的开高低收和成交量，请用 ⤢ 放大图表 或 在浏览器中打开。')}
+              <Text color={MA_COLORS.ma20}>MA20</Text> · <Text color={MA_COLORS.ma50}>MA50</Text> · <Text color={MA_COLORS.ma200}>MA200</Text> · {L('dashed lines are support and resistance.', '虚线为支撑与阻力。')}
             </Text>
             <Text weight="semibold">
-              Key levels <Text dimColor size="footnote">· hover an underlined name for what it means</Text>
+              {L('Key levels', '关键价位')} <Text dimColor size="footnote">{L('· hover an underlined name for what it means', '· 悬停带下划线的名称查看含义')}</Text>
             </Text>
-            {explained(levelRows(a, p.range), ['Level', 'Price', 'vs. now'], 'level')}
-            <Text weight="semibold">Indicators</Text>
-            {explained(statRows(a, data), ['Measure', 'Value', 'Reading'], 'stat')}
-            <Text weight="semibold">Price-drop check</Text>
+            {explained(levelRows(a, p.range, lang), [L('Level', '价位'), L('Price', '价格'), L('vs. now', '较现价')], 'level')}
+            <Text weight="semibold">{L('Indicators', '指标')}</Text>
+            {explained(statRows(a, data, lang), [L('Measure', '指标'), L('Value', '数值'), L('Reading', '解读')], 'stat')}
+            <Text weight="semibold">{L('Price-drop check', '下跌检查')}</Text>
             <Box flexDirection="column">
               {a.insights.map(i => (
                 <Text>
@@ -1165,11 +1259,14 @@ export const register: Register = on => {
             </Box>
             <Markdown
               dimColor
-              text={
+              text={L(
                 '**Before acting on a drop, ask:** 1) Why did it fall? (News tab) 2) Is the 200-day trend still up? ' +
-                '3) Where is the next support, and how much would you lose if it breaks? 4) Is earnings or a big data release coming? ' +
-                '5) Would a loss to your exit level stay within the risk you set per trade (often 1–2% of the account)?'
-              }
+                  '3) Where is the next support, and how much would you lose if it breaks? 4) Is earnings or a big data release coming? ' +
+                  '5) Would a loss to your exit level stay within the risk you set per trade (often 1–2% of the account)?',
+                '**面对下跌，先问自己：** 1）为什么跌？（看新闻页）2）200 日均线的趋势还向上吗？' +
+                  '3）下一个支撑在哪里，跌破会亏多少？4）是否临近财报或重要数据发布？' +
+                  '5）跌到你的离场价时，亏损是否仍在你设定的单笔风险之内（通常为账户的 1–2%）？',
+              )}
             />
           </Box>
         )
@@ -1178,7 +1275,7 @@ export const register: Register = on => {
       const sym = encodeURIComponent(data.symbol)
       body = (
         <Box flexDirection="column" gap={1}>
-          {data.news.length === 0 && <Text dimColor>No recent headlines from Nasdaq.</Text>}
+          {data.news.length === 0 && <Text dimColor>{L('No recent headlines from Nasdaq.', 'Nasdaq 暂无近期新闻。')}</Text>}
           {data.news.map(n => (
             <Box flexDirection="column">
               <Text>
@@ -1190,28 +1287,34 @@ export const register: Register = on => {
               </Text>
             </Box>
           ))}
-          <Text dimColor size="footnote">⚠ marks headlines with words like lawsuit, probe, downgrade, recall or guidance cut: possible incidents worth reading first.</Text>
+          <Text dimColor size="footnote">
+            {L(
+              '⚠ marks headlines with words like lawsuit, probe, downgrade, recall or guidance cut: possible incidents worth reading first.',
+              '⚠ 标出含有诉讼、调查、降级、召回、下调指引等字眼的标题：可能的突发事件，建议先读。',
+            )}
+          </Text>
           <Text>
-            More: <Link href={`https://finance.yahoo.com/quote/${sym}/news`} label="Yahoo Finance" /> · <Link href={`https://news.google.com/search?q=${sym}%20stock`} label="Google News" /> ·{' '}
-            <Link href={`https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${sym}&type=8-K`} label="SEC filings (8-K)" />
+            {L('More: ', '更多：')}
+            <Link href={`https://finance.yahoo.com/quote/${sym}/news`} label="Yahoo Finance" /> · <Link href={`https://news.google.com/search?q=${sym}%20stock`} label="Google News" /> ·{' '}
+            <Link href={`https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${sym}&type=8-K`} label={L('SEC filings (8-K)', 'SEC 公告（8-K）')} />
           </Text>
         </Box>
       )
     } else {
-      const upcoming = buildEvents({ today, horizon: 14, calendar: cal, tickers: all, watchlist: followed(p, await read($, portfolio)), mine: await read($, myEvents) }).filter(ev => ev.importance === 3)
+      const upcoming = buildEvents({ today, horizon: 14, calendar: cal, tickers: all, watchlist: followed(p, await read($, portfolio)), mine: await read($, myEvents), lang }).filter(ev => ev.importance === 3)
       body = (
         <Box flexDirection="column" gap={1}>
           <Button key="open-cal" variant="primary" onPress={() => void openCalendar($)}>
-            Open the full market calendar
+            {L('Open the full market calendar', '打开完整市场日历')}
           </Button>
-          {cal.fetchedAt === 0 && <Text dimColor>Loading the calendar…</Text>}
-          <Text weight="semibold">Most important, next two weeks</Text>
-          {upcoming.length === 0 && <Text dimColor>Nothing marked ★★★.</Text>}
+          {cal.fetchedAt === 0 && <Text dimColor>{L('Loading the calendar…', '正在加载日历…')}</Text>}
+          <Text weight="semibold">{L('Most important, next two weeks', '未来两周最重要')}</Text>
+          {upcoming.length === 0 && <Text dimColor>{L('Nothing marked ★★★.', '没有 ★★★ 事件。')}</Text>}
           {upcoming.map(ev => (
             <Text>
               <Text color={CATEGORY[ev.category].color}>● </Text>
-              {dayLabel(ev.date)}
-              {ev.time ? ` ${ev.time} ET` : ''} · {ev.title}
+              {dayLabel(ev.date, lang)}
+              {ev.time ? ` ${etTime(lang, ev.time)}` : ''} · {ev.title}
             </Text>
           ))}
         </Box>
@@ -1229,31 +1332,40 @@ export const register: Register = on => {
         {body}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true), refreshShownReport($, true)])}>
-            {isLoading ? 'Refreshing…' : 'Refresh'}
+            {isLoading ? L('Refreshing…', '刷新中…') : L('Refresh', '刷新')}
           </Button>
           <Button
             key="ask"
             onPress={() =>
               void $.prompt.submit({
-                text: `Use the stock-desk analyze skill for a full read on ${data.symbol} over the next ${horizonOf(p)} trading days, and check the latest news and upcoming catalysts.`,
+                text: L(
+                  `Use the stock-desk analyze skill for a full read on ${data.symbol} over the next ${horizonOf(p)} trading days, and check the latest news and upcoming catalysts.`,
+                  `用 stock-desk analyze 技能全面分析 ${data.symbol} 未来 ${horizonOf(p)} 个交易日，并查看最新新闻和即将到来的催化剂。`,
+                ),
                 asUser: true,
               })
             }
           >
-            Ask Claude about {data.symbol}
+            {L(`Ask Claude about ${data.symbol}`, `问 Claude 关于 ${data.symbol}`)}
           </Button>
           <Button key="open-portfolio" onPress={() => void openPortfolio($)}>
-            My portfolio
+            {L('My portfolio', '我的持仓')}
           </Button>
           <Button key="colors" plain onPress={() => void setPrefs($, x => ({ ...x, colors: x.colors === 'red-up' ? 'green-up' : 'red-up' }))}>
-            {p.colors === 'red-up' ? 'Colors: red up (红涨绿跌)' : 'Colors: green up'}
+            {p.colors === 'red-up' ? L('Colors: red up (红涨绿跌)', '颜色：红涨绿跌') : L('Colors: green up', '颜色：绿涨红跌')}
+          </Button>
+          <Button key="lang" plain onPress={() => void switchLang($)}>
+            {L('Language: English', '语言：中文')} <Text dimColor>· {LANGS.find(([l]) => l !== lang)?.[1]}</Text>
           </Button>
           <Button key="remove" plain dimColor onPress={() => void remove($, data.symbol)}>
-            {group ? `Remove ${data.symbol} from ${group.name}` : `Remove ${data.symbol}`}
+            {group ? L(`Remove ${data.symbol} from ${group.name}`, `从 ${group.name} 移除 ${data.symbol}`) : L(`Remove ${data.symbol}`, `移除 ${data.symbol}`)}
           </Button>
         </Box>
         <Text dimColor size="footnote">
-          Updated {ago(data.fetchedAt)} · data: Nasdaq, CBOE (options, VIX), CNBC (futures), CFTC (COT) · auto-refresh every 5 min. Analysis of market data, not investment advice.
+          {L(
+            `Updated ${ago(data.fetchedAt, lang)} · data: Nasdaq, CBOE (options, VIX), CNBC (futures), CFTC (COT) · auto-refresh every 5 min. Analysis of market data, not investment advice.`,
+            `更新于${ago(data.fetchedAt, lang)} · 数据：Nasdaq、CBOE（期权、VIX）、CNBC（期货）、CFTC（COT）· 每 5 分钟自动刷新。基于市场数据的分析，不构成投资建议。`,
+          )}
         </Text>
       </Box>
     )
@@ -1266,10 +1378,12 @@ export const register: Register = on => {
     const { Box, Text, Button, Markdown } = t
     const Svg = e.surface !== 'terminal' && 'Svg' in t ? t.Svg : undefined
     const p = await read($, prefs)
+    const lang = langOf(p)
+    const L = (en: string, zh: string) => tr(lang, en, zh)
     const all = await read($, tickers)
     const data = all[p.selected]
-    const a = data ? analyze(data.bars, p.bigRange) : undefined
-    if (!data || !a) return <Text dimColor>Loading {p.selected}…</Text>
+    const a = data ? analyze(data.bars, p.bigRange, undefined, lang) : undefined
+    if (!data || !a) return <Text dimColor>{L(`Loading ${p.selected}…`, `正在加载 ${p.selected}…`)}</Text>
 
     const cols = e.props.bodyColumns ?? 120
     const width = clamp(cols * 8, 560, 1600)
@@ -1298,29 +1412,31 @@ export const register: Register = on => {
             </Button>
           ))}
           <Button key="big-browser" onPress={() => void openInBrowser($)}>
-            Open in browser (full screen)
+            {L('Open in browser (full screen)', '在浏览器中打开（全屏）')}
           </Button>
           <Button key="hover-candles" plain={p.hoverCandles ? undefined : true} variant={p.hoverCandles ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, hoverCandles: !x.hoverCandles }))}>
-            {p.hoverCandles ? 'Candle details on hover: on' : 'Candle details on hover: off'}
+            {p.hoverCandles ? L('Candle details on hover: on', '悬停显示 K 线详情：开') : L('Candle details on hover: off', '悬停显示 K 线详情：关')}
           </Button>
         </Box>
         {Svg ? (
           // An interactive SVG is drawn in a frame of its own, which keeps the
           // scroll wheel while the pointer is over it; it is opt-in for that.
           <Svg
-            source={candleChart({ bars: data.bars, from, a, width, height, colors: p.colors })}
-            alt={`${data.symbol} daily candlestick chart, ${p.bigRange}`}
+            source={candleChart({ bars: data.bars, from, a, width, height, colors: p.colors, lang })}
+            alt={L(`${data.symbol} daily candlestick chart, ${p.bigRange}`, `${data.symbol} 日 K 线图，${p.bigRange}`)}
             isInteractive={p.hoverCandles ? true : undefined}
           />
         ) : (
-          <Text dimColor>The chart draws in the desktop app; use Open in browser here.</Text>
+          <Text dimColor>{L('The chart draws in the desktop app; use Open in browser here.', '图表在桌面应用中显示；这里请用“在浏览器中打开”。')}</Text>
         )}
         <Text dimColor size="footnote">
-          {p.hoverCandles ? 'Hover any candle for its numbers. While this is on, scroll with the pointer beside the chart, not over it. ' : 'Turn on candle details to hover each candle, or see the last sessions below. '}
-          <Text color={MA_COLORS.ma20}>MA20</Text> · <Text color={MA_COLORS.ma50}>MA50</Text> · <Text color={MA_COLORS.ma200}>MA200</Text> · Esc closes this pane.
+          {p.hoverCandles
+            ? L('Hover any candle for its numbers. While this is on, scroll with the pointer beside the chart, not over it. ', '悬停任意 K 线查看数值。开启时，请把指针放在图表旁边滚动，不要放在图上。')
+            : L('Turn on candle details to hover each candle, or see the last sessions below. ', '开启 K 线详情后可悬停查看每根 K 线，或看下方最近的交易日。')}
+          <Text color={MA_COLORS.ma20}>MA20</Text> · <Text color={MA_COLORS.ma50}>MA50</Text> · <Text color={MA_COLORS.ma200}>MA200</Text> · {L('Esc closes this pane.', '按 Esc 关闭此面板。')}
         </Text>
-        <Text weight="semibold">Last 10 sessions</Text>
-        <Markdown text={sessionsMarkdown(data.bars, 10)} />
+        <Text weight="semibold">{L('Last 10 sessions', '最近 10 个交易日')}</Text>
+        <Markdown text={sessionsMarkdown(data.bars, 10, lang)} />
       </Box>
     )
   })
@@ -1332,10 +1448,12 @@ export const register: Register = on => {
     const { Box, Text, Button } = t
     const Input = e.surface !== 'mobile' && 'Input' in t ? t.Input : undefined
     const p = await read($, prefs)
+    const lang = langOf(p)
+    const L = (en: string, zh: string) => tr(lang, en, zh)
     const cal = await read($, calendar)
     const loading = await read($, busy)
     const today = marketToday()
-    const events = buildEvents({ today, horizon: p.calHorizon, calendar: cal, tickers: await read($, tickers), watchlist: followed(p, await read($, portfolio)), mine: await read($, myEvents) })
+    const events = buildEvents({ today, horizon: p.calHorizon, calendar: cal, tickers: await read($, tickers), watchlist: followed(p, await read($, portfolio)), mine: await read($, myEvents), lang })
     const shown = events.filter(ev => p.calCategories.includes(ev.category))
     const days = [...new Set(shown.map(ev => ev.date))]
     const counts = new Map<CalCategory, number>()
@@ -1347,13 +1465,13 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          {HORIZONS.map(([span, label]) => (
+          {HORIZONS.map(([span, en, zh]) => (
             <Button key={`h-${span}`} plain={p.calHorizon === span ? undefined : true} variant={p.calHorizon === span ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, calHorizon: span }))}>
-              {label}
+              {L(en, zh)}
             </Button>
           ))}
           <Button key="cal-refresh" plain onPress={() => void refreshCalendar($, true)}>
-            {loading.includes('#calendar') ? 'Refreshing…' : 'Refresh'}
+            {loading.includes('#calendar') ? L('Refreshing…', '刷新中…') : L('Refresh', '刷新')}
           </Button>
         </Box>
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -1362,27 +1480,27 @@ export const register: Register = on => {
 
             return (
               <Button key={`cat-${c}`} plain={isOn ? undefined : true} variant={isOn ? 'primary' : undefined} onPress={() => toggle(c)}>
-                <Text color={isOn ? undefined : CATEGORY[c].color}>●</Text> {CATEGORY[c].label} <Text dimColor>{counts.get(c) ?? 0}</Text>
+                <Text color={isOn ? undefined : CATEGORY[c].color}>●</Text> {catLabel(c, lang)} <Text dimColor>{counts.get(c) ?? 0}</Text>
               </Button>
             )
           })}
         </Box>
-        {Input && <Input key="add-event" placeholder="Add your own: 2026-11-20 Nvidia GTC" submitLabel="Add" onSubmit={value => void addMyEvent($, value)} />}
-        {cal.fetchedAt === 0 && <Text dimColor>Loading earnings and economic data…</Text>}
+        {Input && <Input key="add-event" placeholder={L('Add your own: 2026-11-20 Nvidia GTC', '添加自己的事件：2026-11-20 Nvidia GTC')} submitLabel={L('Add', '添加')} onSubmit={value => void addMyEvent($, value)} />}
+        {cal.fetchedAt === 0 && <Text dimColor>{L('Loading earnings and economic data…', '正在加载财报与经济数据…')}</Text>}
         {cal.error && <Text color="warning">{cal.error}</Text>}
-        {shown.length === 0 && cal.fetchedAt > 0 && <Text dimColor>Nothing in this window for the kinds you picked.</Text>}
+        {shown.length === 0 && cal.fetchedAt > 0 && <Text dimColor>{L('Nothing in this window for the kinds you picked.', '所选类别在这段时间内没有事件。')}</Text>}
         {days.map(day => (
           <Box flexDirection="column">
             <Text weight="semibold">
-              {dayLabel(day)} <Text dimColor>· {relative(today, day)}</Text>
+              {dayLabel(day, lang)} <Text dimColor>· {relative(today, day, lang)}</Text>
             </Text>
             {shown
               .filter(ev => ev.date === day)
               .map(ev => (
                 <Box flexDirection="column" paddingLeft={2}>
                   <Text>
-                    <Text color={CATEGORY[ev.category].color}>● {CATEGORY[ev.category].label}</Text>{' '}
-                    <Text color={ev.importance === 3 ? 'warning' : 'subtle'}>{STARS[ev.importance]}</Text> {ev.time ? `${ev.time} ET · ` : ''}
+                    <Text color={CATEGORY[ev.category].color}>● {catLabel(ev.category, lang)}</Text>{' '}
+                    <Text color={ev.importance === 3 ? 'warning' : 'subtle'}>{STARS[ev.importance]}</Text> {ev.time ? `${etTime(lang, ev.time)} · ` : ''}
                     <Text weight={ev.importance === 3 ? 'semibold' : undefined}>{ev.title}</Text>
                   </Text>
                   {ev.detail && (
@@ -1392,7 +1510,7 @@ export const register: Register = on => {
                   )}
                   {ev.myId && (
                     <Button key={`del-${ev.myId}`} plain dimColor onPress={() => void setMyEvents($, list => list.filter(m => m.id !== ev.myId))}>
-                      Remove
+                      {L('Remove', '移除')}
                     </Button>
                   )}
                 </Box>
@@ -1400,7 +1518,10 @@ export const register: Register = on => {
           </Box>
         ))}
         <Text dimColor size="footnote">
-          ★★★ moves the whole market · ★★ notable · ★ minor. Earnings and economic releases come from Nasdaq and reach four weeks ahead; Fed meetings follow the Fed's 2026 schedule; holidays, options expiry and election day are worked out from exchange and federal rules. Ask Claude to add other events (a funding deadline, a court ruling, a summit) and they appear here. Times are US Eastern.
+          {L(
+            "★★★ moves the whole market · ★★ notable · ★ minor. Earnings and economic releases come from Nasdaq and reach four weeks ahead; Fed meetings follow the Fed's 2026 schedule; holidays, options expiry and election day are worked out from exchange and federal rules. Ask Claude to add other events (a funding deadline, a court ruling, a summit) and they appear here. Times are US Eastern.",
+            '★★★ 影响整个市场 · ★★ 值得关注 · ★ 次要。财报和经济数据来自 Nasdaq，覆盖未来四周；美联储会议按 2026 年日程；假日、期权到期日和选举日按交易所与联邦规则推算。可以让 Claude 添加其他事件（拨款截止日、法院裁决、峰会），会显示在这里。时间均为美东时间。',
+          )}
         </Text>
       </Box>
     )
@@ -1414,13 +1535,15 @@ export const register: Register = on => {
     const Input = e.surface !== 'mobile' && 'Input' in t ? t.Input : undefined
     const Svg = e.surface !== 'terminal' && 'Svg' in t ? t.Svg : undefined
     const p = await read($, prefs)
+    const lang = langOf(p)
+    const L = (en: string, zh: string) => tr(lang, en, zh)
     const pf = await read($, portfolio)
     const all = await read($, tickers)
     const sized = await read($, sizer)
     const today = marketToday()
     const cols = e.props.bodyColumns ?? 80
-    const { holdings, totals, sectors } = valuePortfolio(pf, all)
-    const checks = runChecks(pf, all, await read($, calendar), today)
+    const { holdings, totals, sectors } = valuePortfolio(pf, all, lang)
+    const checks = runChecks(pf, all, await read($, calendar), today, lang)
     const pnlColor = (n: number) => (n >= 0 ? upColor(p) : downColor(p))
     const usd = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
@@ -1447,8 +1570,8 @@ export const register: Register = on => {
     const palette = ['#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ef4444', '#14b8a6', '#ec4899', '#84cc16', '#64748b']
     const slices = [
       ...holdings.slice(0, 8).map((pos, i) => ({ label: pos.symbol, pct: pos.weight, color: palette[i]! })),
-      ...(holdings.length > 8 ? [{ label: 'Other', pct: holdings.slice(8).reduce((s, pos) => s + pos.weight, 0), color: palette[8]! }] : []),
-      ...(totals.cash > 0 && totals.value > 0 ? [{ label: 'Cash', pct: (totals.cash / totals.value) * 100, color: '#9ca3af' }] : []),
+      ...(holdings.length > 8 ? [{ label: L('Other', '其他'), pct: holdings.slice(8).reduce((s, pos) => s + pos.weight, 0), color: palette[8]! }] : []),
+      ...(totals.cash > 0 && totals.value > 0 ? [{ label: L('Cash', '现金'), pct: (totals.cash / totals.value) * 100, color: '#9ca3af' }] : []),
     ]
     const barW = clamp(cols * 7.5, 300, 900)
     let x = 0
@@ -1466,7 +1589,8 @@ export const register: Register = on => {
       '</svg>'
 
     const positionsTable =
-      `| Ticker | Shares | Avg cost | Price | Value | Weight | Today | Profit/loss | Stop / target |\n|---|---|---|---|---|---|---|---|---|\n` +
+      L('| Ticker | Shares | Avg cost | Price | Value | Weight | Today | Profit/loss | Stop / target |', '| 代码 | 股数 | 平均成本 | 现价 | 市值 | 占比 | 今日 | 盈亏 | 止损 / 目标价 |') +
+      `\n|---|---|---|---|---|---|---|---|---|\n` +
       holdings
         .map(
           pos =>
@@ -1479,16 +1603,16 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={1}>
-          {stat('Total value', 'Everything you hold at the latest prices, plus the cash you entered.', usd(totals.value))}
-          {stat("Today's change", "How much your holdings moved in the latest session, in dollars.", usd(totals.day), pnlColor(totals.day))}
-          {stat('Unrealized P/L', 'Gain or loss on what you still hold: current value minus what you paid. It becomes real only when you sell.', `${usd(totals.pnl)} (${signed(totals.pnlPct, 1)}%)`, pnlColor(totals.pnl))}
-          {stat('Realized P/L', 'Gain or loss already locked in by the sells you entered here.', usd(totals.realized), pnlColor(totals.realized))}
-          {stat('Cash', 'Uninvested money, as you entered it ("cash 5000"). Buys and sells here do not change it.', usd(totals.cash))}
-          {stat('Risk to stops', 'What you would lose if every position fell to its stop. Positions without a stop are not counted.', usd(totals.openRisk))}
+          {stat(L('Total value', '总市值'), L('Everything you hold at the latest prices, plus the cash you entered.', '按最新价格计算的全部持仓，加上你录入的现金。'), usd(totals.value))}
+          {stat(L("Today's change", '今日变动'), L('How much your holdings moved in the latest session, in dollars.', '持仓在最近一个交易日的变动金额（美元）。'), usd(totals.day), pnlColor(totals.day))}
+          {stat(L('Unrealized P/L', '浮动盈亏'), L('Gain or loss on what you still hold: current value minus what you paid. It becomes real only when you sell.', '仍持有部分的盈亏：现值减去成本。卖出后才会实现。'), `${usd(totals.pnl)} (${signed(totals.pnlPct, 1)}%)`, pnlColor(totals.pnl))}
+          {stat(L('Realized P/L', '已实现盈亏'), L('Gain or loss already locked in by the sells you entered here.', '你在这里录入的卖出已锁定的盈亏。'), usd(totals.realized), pnlColor(totals.realized))}
+          {stat(L('Cash', '现金'), L('Uninvested money, as you entered it ("cash 5000"). Buys and sells here do not change it.', '未投资的资金，按你录入的数（"cash 5000"）。这里的买卖不会改变它。'), usd(totals.cash))}
+          {stat(L('Risk to stops', '止损风险'), L('What you would lose if every position fell to its stop. Positions without a stop are not counted.', '如果每个持仓都跌到止损价会亏多少。没有设止损的持仓不计入。'), usd(totals.openRisk))}
         </Box>
         {holdings.length > 0 && (
           <Box flexDirection="column">
-            {Svg && <Svg source={bar} alt={`Allocation: ${slices.map(sl => `${sl.label} ${sl.pct.toFixed(0)}%`).join(', ')}`} />}
+            {Svg && <Svg source={bar} alt={`${L('Allocation: ', '配置：')}${slices.map(sl => `${sl.label} ${sl.pct.toFixed(0)}%`).join(', ')}`} />}
             <Text dimColor size="footnote">
               {slices.map(sl => (
                 <Text>
@@ -1497,20 +1621,26 @@ export const register: Register = on => {
               ))}
             </Text>
             <Text dimColor size="footnote">
-              Sectors: {sectors.map(([name, pct]) => `${name} ${pct.toFixed(0)}%`).join(' · ')}
+              {L('Sectors: ', '行业：')}
+              {sectors.map(([name, pct]) => `${name} ${pct.toFixed(0)}%`).join(' · ')}
             </Text>
           </Box>
         )}
         {Input && (
-          <Input key="trade" placeholder='Add a trade: "NVDA 50 @ 120.5 stop 110 target 160", "sell NVDA 10 @ 140" or "cash 5000"' submitLabel="Enter" onSubmit={value => void enterTrade($, value)} />
+          <Input
+            key="trade"
+            placeholder={L('Add a trade: "NVDA 50 @ 120.5 stop 110 target 160", "sell NVDA 10 @ 140" or "cash 5000"', '录入交易："NVDA 50 @ 120.5 stop 110 target 160"、"sell NVDA 10 @ 140" 或 "cash 5000"')}
+            submitLabel={L('Enter', '录入')}
+            onSubmit={value => void enterTrade($, value)}
+          />
         )}
         {holdings.length === 0 ? (
-          <Text dimColor>No positions yet. Enter one above, e.g. NVDA 50 @ 120.5 stop 110. Your holdings stay on this computer.</Text>
+          <Text dimColor>{L('No positions yet. Enter one above, e.g. NVDA 50 @ 120.5 stop 110. Your holdings stay on this computer.', '还没有持仓。在上方录入一笔，例如 NVDA 50 @ 120.5 stop 110。持仓只保存在这台电脑上。')}</Text>
         ) : (
           <Box flexDirection="column" gap={1}>
             <Markdown text={positionsTable} />
             <Box flexDirection="row" flexWrap="wrap" gap={1}>
-              <Text dimColor>Edit:</Text>
+              <Text dimColor>{L('Edit:', '编辑：')}</Text>
               {holdings.map(pos => (
                 <Button key={`edit-${pos.symbol}`} plain={p.editing === pos.symbol ? undefined : true} variant={p.editing === pos.symbol ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, editing: x.editing === pos.symbol ? undefined : pos.symbol }))}>
                   {pos.symbol}
@@ -1522,22 +1652,27 @@ export const register: Register = on => {
         {editing && Input && (
           <Box flexDirection="column" gap={1} borderStyle="round" paddingX={1}>
             <Text weight="semibold">
-              {editing.symbol} <Text dimColor>· press Enter in a field to save it</Text>
+              {editing.symbol} <Text dimColor>{L('· press Enter in a field to save it', '· 在输入框按回车保存')}</Text>
             </Text>
-            <Input key={`pos-shares-${editing.symbol}`} label="Shares" value={String(editing.shares)} onSubmit={v => void editPosition($, editing.symbol, 'shares', v)} />
-            <Input key={`pos-cost-${editing.symbol}`} label="Average cost per share" value={String(editing.cost)} onSubmit={v => void editPosition($, editing.symbol, 'cost', v)} />
-            <Input key={`pos-stop-${editing.symbol}`} label="Stop (the price where you plan to get out; empty to clear)" value={editing.stop === undefined ? '' : String(editing.stop)} onSubmit={v => void editPosition($, editing.symbol, 'stop', v)} />
-            <Input key={`pos-target-${editing.symbol}`} label="Target (empty to clear)" value={editing.target === undefined ? '' : String(editing.target)} onSubmit={v => void editPosition($, editing.symbol, 'target', v)} />
-            <Input key={`pos-note-${editing.symbol}`} label="Note: why you bought it, what would change your mind" value={editing.note ?? ''} rows={2} onSubmit={v => void editPosition($, editing.symbol, 'note', v)} />
+            <Input key={`pos-shares-${editing.symbol}`} label={L('Shares', '股数')} value={String(editing.shares)} onSubmit={v => void editPosition($, editing.symbol, 'shares', v)} />
+            <Input key={`pos-cost-${editing.symbol}`} label={L('Average cost per share', '每股平均成本')} value={String(editing.cost)} onSubmit={v => void editPosition($, editing.symbol, 'cost', v)} />
+            <Input
+              key={`pos-stop-${editing.symbol}`}
+              label={L('Stop (the price where you plan to get out; empty to clear)', '止损（你计划离场的价格；留空则清除）')}
+              value={editing.stop === undefined ? '' : String(editing.stop)}
+              onSubmit={v => void editPosition($, editing.symbol, 'stop', v)}
+            />
+            <Input key={`pos-target-${editing.symbol}`} label={L('Target (empty to clear)', '目标价（留空则清除）')} value={editing.target === undefined ? '' : String(editing.target)} onSubmit={v => void editPosition($, editing.symbol, 'target', v)} />
+            <Input key={`pos-note-${editing.symbol}`} label={L('Note: why you bought it, what would change your mind', '备注：为什么买、什么会让你改变主意')} value={editing.note ?? ''} rows={2} onSubmit={v => void editPosition($, editing.symbol, 'note', v)} />
             <Box flexDirection="row" gap={1}>
               <Button key="pos-chart" onPress={() => void select($, editing.symbol).then(() => openMain($))}>
-                Open its chart
+                {L('Open its chart', '打开它的图表')}
               </Button>
               <Button key="pos-remove" plain dimColor onPress={() => void setPortfolio($, x => ({ ...x, positions: x.positions.filter(y => y.symbol !== editing.symbol) })).then(() => setPrefs($, x => ({ ...x, editing: undefined })))}>
-                Remove position
+                {L('Remove position', '删除持仓')}
               </Button>
               <Button key="pos-done" plain onPress={() => void setPrefs($, x => ({ ...x, editing: undefined }))}>
-                Done
+                {L('Done', '完成')}
               </Button>
             </Box>
           </Box>
@@ -1545,9 +1680,10 @@ export const register: Register = on => {
         {holdings.length > 0 && (
           <Box flexDirection="column">
             <Text weight="semibold">
-              Checks against your rules <Text dimColor size="footnote">· {checks.filter(c => c.tone === 'risk' || c.tone === 'warn').length} need a look</Text>
+              {L('Checks against your rules', '规则检查')}{' '}
+              <Text dimColor size="footnote">{L(`· ${checks.filter(c => c.tone === 'risk' || c.tone === 'warn').length} need a look`, `· ${checks.filter(c => c.tone === 'risk' || c.tone === 'warn').length} 项需要关注`)}</Text>
             </Text>
-            {checks.length === 0 && <Text color="success">● Nothing crosses your rules.</Text>}
+            {checks.length === 0 && <Text color="success">{L('● Nothing crosses your rules.', '● 没有触发你的规则。')}</Text>}
             {checks.map(c => (
               <Text>
                 <Text color={TONE_COLOR[c.tone]}>{TONE_MARK[c.tone]} </Text>
@@ -1557,40 +1693,55 @@ export const register: Register = on => {
           </Box>
         )}
         <Box flexDirection="column">
-          <Text weight="semibold">Position-size calculator</Text>
-          {Input && <Input key="sizer" placeholder='Entry and stop, e.g. "NVDA 180 stop 165"' submitLabel="Size it" onSubmit={value => void update($, sizer, () => sizePosition(value, totals.value, pf.rules))} />}
-          <Text dimColor={!sized}>{sized || `How many shares keep a stopped-out trade to your ${pf.rules.riskPerTradePct}% risk per trade.`}</Text>
+          <Text weight="semibold">{L('Position-size calculator', '仓位计算器')}</Text>
+          {Input && (
+            <Input
+              key="sizer"
+              placeholder={L('Entry and stop, e.g. "NVDA 180 stop 165"', '入场价和止损，例如 "NVDA 180 stop 165"')}
+              submitLabel={L('Size it', '计算')}
+              onSubmit={value => void update($, sizer, () => sizePosition(value, totals.value, pf.rules, lang))}
+            />
+          )}
+          <Text dimColor={!sized}>{sized || L(`How many shares keep a stopped-out trade to your ${pf.rules.riskPerTradePct}% risk per trade.`, `买多少股能让止损出局的亏损不超过单笔风险 ${pf.rules.riskPerTradePct}%。`)}</Text>
         </Box>
         <Button key="rules" plain onPress={() => void setPrefs($, x => ({ ...x, showRules: !x.showRules }))}>
-          {p.showRules ? '▾ Your rules' : '▸ Your rules'} ({pf.rules.maxWeightPct}% max position · {pf.rules.maxLossPct}% loss alert · {pf.rules.riskPerTradePct}% risk per trade)
+          {p.showRules ? L('▾ Your rules', '▾ 你的规则') : L('▸ Your rules', '▸ 你的规则')}{' '}
+          {L(
+            `(${pf.rules.maxWeightPct}% max position · ${pf.rules.maxLossPct}% loss alert · ${pf.rules.riskPerTradePct}% risk per trade)`,
+            `（单只上限 ${pf.rules.maxWeightPct}% · 亏损提醒 ${pf.rules.maxLossPct}% · 单笔风险 ${pf.rules.riskPerTradePct}%）`,
+          )}
         </Button>
         {p.showRules &&
           Input &&
           RULE_LABELS.map(r => (
             <Box flexDirection="column">
-              <Input key={`rule-${r.key}`} label={`${r.label} (${r.unit})`} value={String(pf.rules[r.key])} onSubmit={v => void setRule($, r.key, v)} />
+              <Input key={`rule-${r.key}`} label={ruleText(r, lang).title} value={String(pf.rules[r.key])} onSubmit={v => void setRule($, r.key, v)} />
               <Text dimColor size="footnote">
-                {r.meaning}
+                {ruleText(r, lang).meaning}
               </Text>
             </Box>
           ))}
         {pf.trades.length > 0 && (
           <Box flexDirection="column">
-            <Text weight="semibold">Recent trades</Text>
+            <Text weight="semibold">{L('Recent trades', '最近交易')}</Text>
             <Markdown
               text={
-                `| Date | Trade | Price | Realized |\n|---|---|---|---|\n` +
+                L('| Date | Trade | Price | Realized |', '| 日期 | 交易 | 价格 | 已实现 |') +
+                `\n|---|---|---|---|\n` +
                 pf.trades
                   .slice(-6)
                   .reverse()
-                  .map(tr => `| ${tr.date} | ${tr.side} ${tr.shares} ${tr.symbol} | ${usd(tr.price)} | ${tr.realized === undefined ? '—' : usd(tr.realized)} |`)
+                  .map(row => `| ${row.date} | ${row.side === 'buy' ? L('buy', '买入') : L('sell', '卖出')} ${row.shares} ${row.symbol} | ${usd(row.price)} | ${row.realized === undefined ? '—' : usd(row.realized)} |`)
                   .join('\n')
               }
             />
           </Box>
         )}
         <Text dimColor size="footnote">
-          Checks compare your positions with the rules you set; they are not recommendations to buy or sell. Prices are about 15 minutes delayed. Your holdings are kept only on this computer.
+          {L(
+            'Checks compare your positions with the rules you set; they are not recommendations to buy or sell. Prices are about 15 minutes delayed. Your holdings are kept only on this computer.',
+            '检查只是把持仓和你设定的规则做比较，不是买卖建议。价格延迟约 15 分钟。持仓只保存在这台电脑上。',
+          )}
         </Text>
       </Box>
     )

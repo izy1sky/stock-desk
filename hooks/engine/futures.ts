@@ -13,7 +13,8 @@
 
 import { addDays, marketToday, parseBars } from '../data'
 import { getJson, num, type Fetch } from './http'
-import { biasOf, clampScore, type Bar, type ModuleResult, type Reading } from './types'
+import { bi, biasText, joinText } from '../i18n'
+import { biasOf, clampScore, type Bar, type ModuleResult, type Reading, type Text } from './types'
 
 export type FuturesRoot = 'ES' | 'NQ' | 'YM' | 'RTY'
 export type IndexSymbol = 'SPX' | 'NDX' | 'DJI' | 'RUT'
@@ -30,6 +31,18 @@ const INDEXES: IndexSymbol[] = ['SPX', 'NDX', 'DJI', 'RUT']
  * are not modelled.
  */
 export type FuturesSession = 'overnight' | 'pre-market' | 'regular' | 'after close' | 'daily break' | 'weekend'
+
+const SESSION_ZH: Record<FuturesSession, string> = {
+  overnight: '隔夜',
+  'pre-market': '盘前',
+  regular: '常规交易时段',
+  'after close': '收盘后',
+  'daily break': '每日休市',
+  weekend: '周末',
+}
+
+/** The futures session in both languages. */
+export const sessionText = (s: FuturesSession): Text => bi(s, SESSION_ZH[s])
 
 export type FuturesQuote = {
   root: FuturesRoot
@@ -428,7 +441,7 @@ export type ImpliedCash = {
   changeBase: number
   fairBasisNote: string
   /** Set when the basis is outside a normal carry (about -1% to +8% a year). */
-  anomaly?: string
+  anomaly?: Text
 }
 
 /**
@@ -473,9 +486,15 @@ export function impliedCash(fut: FuturesQuote, cash: CashQuote, now = Date.now()
   const anomaly = !Number.isFinite(carryPct)
     ? undefined
     : carryPct > 8
-      ? `${fut.root} basis rich: ${rnd(carryPct, 1)}% a year over cash (demand for long futures, or a stale cash close)`
+      ? bi(
+          `${fut.root} basis rich: ${rnd(carryPct, 1)}% a year over cash (demand for long futures, or a stale cash close)`,
+          `${fut.root} 基差偏高：较现货年化 ${rnd(carryPct, 1)}%（期货多头需求旺盛，或现货收盘价已过时）`,
+        )
       : carryPct < -1
-        ? `${fut.root} below fair value: ${rnd(carryPct, 1)}% a year (hedging pressure, or a stale cash close)`
+        ? bi(
+            `${fut.root} below fair value: ${rnd(carryPct, 1)}% a year (hedging pressure, or a stale cash close)`,
+            `${fut.root} 低于公允价值：年化 ${rnd(carryPct, 1)}%（对冲压力，或现货收盘价已过时）`,
+          )
         : undefined
   const note =
     `${fut.root} settled ${rnd(basisPrev)} pts over ${cash.symbol} (${Number.isFinite(carryPct) ? `${rnd(carryPct, 1)}% a year carry, ` : ''}` +
@@ -596,7 +615,7 @@ export type CotStats = {
   lev: CotGroup
   am: CotGroup
   dealer: CotGroup
-  flags: string[]
+  flags: Text[]
 }
 
 function positionIn(values: number[], x: number): { index: number; pct: number } {
@@ -645,10 +664,22 @@ export function cotStats(rows: CotRow[], now = Date.now(), market?: FuturesRoot)
   const ageDays = Math.round((Date.parse(`${today}T12:00:00Z`) - Date.parse(`${latest.date}T12:00:00Z`)) / DAY_MS)
   const overdue = today > addDays(nextRelease, 3)
   const name = market ?? 'COT'
-  const flags: string[] = []
-  if (lev.crowded) flags.push(`${name} leveraged funds crowded ${lev.crowded} (3y COT index ${lev.index3y})`)
-  if (am.crowded) flags.push(`${name} asset managers at a 3-year ${am.crowded === 'long' ? 'high' : 'low'} (index ${am.index3y})`)
-  if (overdue) flags.push(`${name} COT report overdue: latest is as of ${latest.date}`)
+  const flags: Text[] = []
+  if (lev.crowded)
+    flags.push(
+      bi(
+        `${name} leveraged funds crowded ${lev.crowded} (3y COT index ${lev.index3y})`,
+        `${name} 杠杆基金${lev.crowded === 'long' ? '多头拥挤' : '空头拥挤'}（3 年 COT 指数 ${lev.index3y}）`,
+      ),
+    )
+  if (am.crowded)
+    flags.push(
+      bi(
+        `${name} asset managers at a 3-year ${am.crowded === 'long' ? 'high' : 'low'} (index ${am.index3y})`,
+        `${name} 资产管理机构净持仓处于 3 年${am.crowded === 'long' ? '高点' : '低点'}（指数 ${am.index3y}）`,
+      ),
+    )
+  if (overdue) flags.push(bi(`${name} COT report overdue: latest is as of ${latest.date}`, `${name} COT 报告逾期：最新数据截至 ${latest.date}`))
 
   return {
     market,
@@ -880,43 +911,97 @@ export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[
         )
 
   const readings: Reading[] = []
-  const flags: string[] = []
-  for (const q of input.quotes)
-    readings.push({ name: `${q.root} ${q.contract ?? ''}`.trim(), value: q.last, note: `${pct(q.changePct)} vs settle ${q.prevSettle} (${q.source})` })
+  const flags: Text[] = []
+  for (const q of input.quotes) {
+    const name = `${q.root} ${q.contract ?? ''}`.trim()
+    readings.push({
+      name: bi(name, `${name} 期货`),
+      value: q.last,
+      note: bi(`${pct(q.changePct)} vs settle ${q.prevSettle} (${q.source})`, `较结算价 ${q.prevSettle} ${pct(q.changePct)}，来源 ${q.source}`),
+    })
+  }
   for (const imp of Object.values(implied)) {
     if (!imp) continue
-    readings.push({ name: `${imp.index} implied`, value: imp.impliedCash, note: `${pct(imp.impliedChangePct)} vs ${imp.changeBase}; basis ${imp.basisNow} pts` })
+    readings.push({
+      name: bi(`${imp.index} implied`, `期货隐含 ${imp.index}`),
+      value: imp.impliedCash,
+      note: bi(`${pct(imp.impliedChangePct)} vs ${imp.changeBase}; basis ${imp.basisNow} pts`, `较 ${imp.changeBase} ${pct(imp.impliedChangePct)}；基差 ${imp.basisNow} 点`),
+    })
     if (imp.anomaly) flags.push(imp.anomaly)
   }
-  if (nqMinusEs !== undefined) readings.push({ name: 'NQ − ES', value: `${nqMinusEs >= 0 ? '+' : ''}${nqMinusEs.toFixed(2)} pp`, note: nqMinusEs > 0.25 ? 'tech leading: risk appetite' : nqMinusEs < -0.25 ? 'tech lagging: defensive' : 'in line' })
-  if (rtyMinusEs !== undefined) readings.push({ name: 'RTY − ES', value: `${rtyMinusEs >= 0 ? '+' : ''}${rtyMinusEs.toFixed(2)} pp`, note: rtyMinusEs > 0.25 ? 'small caps leading' : rtyMinusEs < -0.25 ? 'small caps lagging' : 'in line' })
-  for (const c of cots) {
+  const pp = (x: number) => `${x >= 0 ? '+' : ''}${x.toFixed(2)}`
+  if (nqMinusEs !== undefined)
     readings.push({
-      name: `${c.market ?? ''} lev funds net`.trim(),
-      value: c.lev.net,
-      note: `3y index ${c.lev.index3y}, 26w ${c.lev.index26w}, ${c.lev.change === undefined ? '' : `${c.lev.change >= 0 ? '+' : ''}${c.lev.change} w/w, `}as of ${c.date}`,
+      name: bi('NQ − ES', 'NQ − ES 强弱差'),
+      value: bi(`${pp(nqMinusEs)} pp`, `${pp(nqMinusEs)} 个百分点`),
+      note:
+        nqMinusEs > 0.25
+          ? bi('tech leading: risk appetite', '科技股领涨：风险偏好较强')
+          : nqMinusEs < -0.25
+            ? bi('tech lagging: defensive', '科技股落后：偏防御')
+            : bi('in line', '步调一致'),
     })
-    readings.push({ name: `${c.market ?? ''} asset mgr net`.trim(), value: c.am.net, note: `3y index ${c.am.index3y}, ${c.am.pctOi}% of OI` })
+  if (rtyMinusEs !== undefined)
+    readings.push({
+      name: bi('RTY − ES', 'RTY − ES 强弱差'),
+      value: bi(`${pp(rtyMinusEs)} pp`, `${pp(rtyMinusEs)} 个百分点`),
+      note: rtyMinusEs > 0.25 ? bi('small caps leading', '小盘股领涨') : rtyMinusEs < -0.25 ? bi('small caps lagging', '小盘股落后') : bi('in line', '步调一致'),
+    })
+  for (const c of cots) {
+    const m = c.market ?? ''
+    const ch = c.lev.change === undefined ? undefined : `${c.lev.change >= 0 ? '+' : ''}${c.lev.change}`
+    readings.push({
+      name: bi(`${m} lev funds net`.trim(), `${m} 杠杆基金净持仓`.trim()),
+      value: c.lev.net,
+      note: bi(
+        `3y index ${c.lev.index3y}, 26w ${c.lev.index26w}, ${ch === undefined ? '' : `${ch} w/w, `}as of ${c.date}`,
+        `3 年 COT 指数 ${c.lev.index3y}，26 周 ${c.lev.index26w}，${ch === undefined ? '' : `周变化 ${ch}，`}截至 ${c.date}`,
+      ),
+    })
+    readings.push({
+      name: bi(`${m} asset mgr net`.trim(), `${m} 资产管理机构净持仓`.trim()),
+      value: c.am.net,
+      note: bi(`3y index ${c.am.index3y}, ${c.am.pctOi}% of OI`, `3 年指数 ${c.am.index3y}，占未平仓量 ${c.am.pctOi}%`),
+    })
     flags.push(...c.flags)
   }
-  if (session) readings.push({ name: 'Session', value: session, note: quoteAgeMin === undefined ? undefined : `quote ${quoteAgeMin} min old` })
-  if (avgMove !== undefined && Math.abs(avgMove) >= 1) flags.unshift(`Large overnight move: ${pct(avgMove)} indicated`)
-  if (nqMinusEs !== undefined && Math.abs(nqMinusEs) >= 0.75) flags.push(`NQ ${nqMinusEs > 0 ? 'outpacing' : 'trailing'} ES by ${Math.abs(nqMinusEs).toFixed(2)} pp`)
-  if (quoteAgeMin !== undefined && quoteAgeMin > 18 * 60) flags.push(`Futures quotes are ${Math.round(quoteAgeMin / 60)} hours old (${session})`)
-  for (const r of ROOTS) if (!byRoot.has(r)) flags.push(`${r} quote unavailable`)
+  if (session)
+    readings.push({
+      name: bi('Session', '交易时段'),
+      value: sessionText(session),
+      note: quoteAgeMin === undefined ? undefined : bi(`quote ${quoteAgeMin} min old`, `报价为 ${quoteAgeMin} 分钟前`),
+    })
+  if (avgMove !== undefined && Math.abs(avgMove) >= 1) flags.unshift(bi(`Large overnight move: ${pct(avgMove)} indicated`, `隔夜波动较大：期货指示 ${pct(avgMove)}`))
+  if (nqMinusEs !== undefined && Math.abs(nqMinusEs) >= 0.75) {
+    const gap = Math.abs(nqMinusEs).toFixed(2)
+    flags.push(bi(`NQ ${nqMinusEs > 0 ? 'outpacing' : 'trailing'} ES by ${gap} pp`, `NQ ${nqMinusEs > 0 ? '跑赢' : '跑输'} ES ${gap} 个百分点`))
+  }
+  if (quoteAgeMin !== undefined && quoteAgeMin > 18 * 60) {
+    const h = Math.round(quoteAgeMin / 60)
+    flags.push(bi(`Futures quotes are ${h} hours old (${session})`, `期货报价已是 ${h} 小时前（${SESSION_ZH[session]}）`))
+  }
+  for (const r of ROOTS) if (!byRoot.has(r)) flags.push(bi(`${r} quote unavailable`, `${r} 报价不可用`))
 
-  let verdict: string
-  if (avgMove === undefined) verdict = 'No futures quotes available.'
+  let verdict: Text
+  if (avgMove === undefined) verdict = bi('No futures quotes available.', '暂无期货报价。')
   else {
     const dir = avgMove > 0.15 ? 'higher' : avgMove < -0.15 ? 'lower' : 'flat'
+    const dirZh = avgMove > 0.15 ? '上涨' : avgMove < -0.15 ? '下跌' : '持平'
     const parts = [
       es !== undefined ? `ES ${pct(changePct.ES ?? es)}` : undefined,
       nq !== undefined ? `NQ ${pct(changePct.NQ ?? nq)}` : undefined,
-    ].filter(Boolean)
-    const imp = implied.ES ? `, implying SPX ${pct(implied.ES.impliedChangePct)}` : ''
-    const rs = nqMinusEs === undefined ? '' : nqMinusEs > 0.25 ? ', tech leading' : nqMinusEs < -0.25 ? ', tech lagging' : ''
-    const lev = cots[0]?.lev.crowded ? `; leveraged funds crowded ${cots[0].lev.crowded}` : ''
-    verdict = `Futures point ${dir} (${biasOf(score)}): ${parts.join(', ') || `move ${pct(avgMove)}`} vs settle${imp}${rs}${lev}.`
+    ].filter((x): x is string => x !== undefined)
+    const moved = joinText(parts.length ? parts : [bi(`move ${pct(avgMove)}`, `变动 ${pct(avgMove)}`)], ', ', '，')
+    const imp = implied.ES ? bi(`, implying SPX ${pct(implied.ES.impliedChangePct)}`, `，对应 SPX ${pct(implied.ES.impliedChangePct)}`) : bi('', '')
+    const rs =
+      nqMinusEs === undefined ? bi('', '') : nqMinusEs > 0.25 ? bi(', tech leading', '，科技股领涨') : nqMinusEs < -0.25 ? bi(', tech lagging', '，科技股落后') : bi('', '')
+    const crowded = cots[0]?.lev.crowded
+    const lev = crowded ? bi(`; leveraged funds crowded ${crowded}`, `；杠杆基金${crowded === 'long' ? '多头拥挤' : '空头拥挤'}`) : bi('', '')
+    const bias = biasOf(score)
+    verdict = bi(
+      `Futures point ${dir} (${bias}): ${moved.en} vs settle${imp.en}${rs.en}${lev.en}.`,
+      `期货指示${dirZh}（${biasText(bias).zh}）：较结算价 ${moved.zh}${imp.zh}${rs.zh}${lev.zh}。`,
+    )
   }
 
   return {

@@ -13,12 +13,30 @@ import {
   parseCot,
   projectMove,
   sessionLabel,
+  sessionText,
   type CashQuote,
   type CotRow,
   type FuturesQuote,
 } from '../hooks/engine/futures'
 import type { Fetch } from '../hooks/engine/http'
 import type { Bar } from '../hooks/engine/types'
+import { isText, type Text } from '../hooks/i18n'
+
+/** Every Text pair inside a value, with where it sits. */
+function texts(x: unknown, path = '$', out: { path: string; t: Text }[] = []): { path: string; t: Text }[] {
+  if (Array.isArray(x)) x.forEach((v, i) => texts(v, `${path}[${i}]`, out))
+  else if (isText(x)) out.push({ path, t: x })
+  else if (x && typeof x === 'object') for (const [k, v] of Object.entries(x)) texts(v, `${path}.${k}`, out)
+
+  return out
+}
+
+/** Each non-empty Text has a Chinese side with at least one CJK character. */
+function expectTranslated(x: unknown) {
+  const all = texts(x)
+  expect(all.length).toBeGreaterThan(0)
+  expect(all.filter(({ t }) => t.en !== '' && !/[一-鿿]/.test(t.zh)).map(({ path, t }) => `${path}: ${t.zh}`)).toEqual([])
+}
 
 const close = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps)
 
@@ -183,7 +201,10 @@ test('implied cash strips the prior basis, scaled by the time left to expiry', (
   expect(r.impliedChangePct).toBe(2.5)
   // 1% over 9.73 days is a 37.5% annual carry: far outside a normal basis.
   close(r.carryPct, 37.52, 0.01)
-  expect(r.anomaly).toMatch(/rich/)
+  expect(r.anomaly!.en).toMatch(/rich/)
+  expect(r.anomaly!.zh).toContain('基差偏高')
+  expectTranslated(r.anomaly)
+  expectTranslated(impliedCash({ ...FUT, last: 990, prevSettle: 990 }, CASH).anomaly)
 
   // Cash open the next day: the basis reference is its prior close (the
   // settlement day's close) and the move is measured from it.
@@ -216,7 +237,9 @@ test('COT nets, indexes, percentiles, crowding and staleness', () => {
   expect(high.am.net).toBe(490)
   expect(high.am.crowded).toBe('short') // asset manager net falls every week
   expect(high).toMatchObject({ date: '2026-11-10', released: '2026-11-13', nextRelease: '2026-11-20', ageDays: 9, overdue: false })
-  expect(high.flags[0]).toMatch(/crowded long/)
+  expect(high.flags[0]!.en).toMatch(/crowded long/)
+  expect(high.flags[0]!.zh).toContain('杠杆基金多头拥挤')
+  expectTranslated(high.flags)
 
   // Forty weeks rising 0..38 then back to 30: 3-year index (30-0)/38, but
   // only the last 26 reports (14..38 and 30) count for the 26-week index.
@@ -229,7 +252,10 @@ test('COT nets, indexes, percentiles, crowding and staleness', () => {
   expect(mid.lev.pct3y).toBe(78.2) // 30 below and one tie among the 39 others
   expect(mid.lev.crowded).toBeUndefined()
 
-  expect(cotStats(cotRows([1, 2, 3]), Date.parse('2026-11-25T15:00:00Z')).overdue).toBe(true)
+  const stale = cotStats(cotRows([1, 2, 3]), Date.parse('2026-11-25T15:00:00Z'))
+  expect(stale.overdue).toBe(true)
+  expect(stale.flags.some(f => f.zh.includes('COT 报告逾期'))).toBe(true)
+  expectTranslated(stale.flags)
 })
 
 // Deterministic "random" daily returns.
@@ -294,13 +320,27 @@ test('the futures module scores a strong tech-led overnight rally and fades a cr
   close(r.stats.implied.ES!.basisPrev, 16.87, 1e-9)
   close(r.stats.implied.ES!.impliedChangePct, 1.23, 0.01)
   expect(r.score).toBeGreaterThan(50)
-  expect(r.verdict).toMatch(/higher/)
-  expect(r.flags.some(f => /Large overnight move/.test(f))).toBe(true)
+  expect(r.verdict.en).toMatch(/higher/)
+  expect(r.verdict.zh).toMatch(/^期货指示上涨（看多）：较结算价 ES /)
+  expect(r.flags.some(f => /Large overnight move/.test(f.en))).toBe(true)
+  expect(r.flags.some(f => f.zh.startsWith('隔夜波动较大'))).toBe(true)
+  expectTranslated(r)
 
   const crowded = futuresModule({ quotes, cash, now: NOW, cot: cotStats(cotRows([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]), NOW, 'ES') })
   expect(crowded.stats.components.positioning).toBe(-20)
   expect(crowded.score).toBe(r.score - 20)
-  expect(crowded.verdict).toMatch(/crowded long/)
+  expect(crowded.verdict.en).toMatch(/crowded long/)
+  expect(crowded.verdict.zh).toContain('；杠杆基金多头拥挤')
+  expectTranslated(crowded)
 
-  expect(futuresModule({ quotes: [], now: NOW }).confidence).toBe(0)
+  const none = futuresModule({ quotes: [], now: NOW })
+  expect(none.confidence).toBe(0)
+  expect(none.verdict).toEqual({ en: 'No futures quotes available.', zh: '暂无期货报价。' })
+  expectTranslated(none)
+  // Quotes a day old, on their own (no cash): the stale-quote flag and the session reading.
+  const old = futuresModule({ quotes, now: NOW + 30 * 3600_000 })
+  expect(old.flags.some(f => f.zh.startsWith('期货报价已是'))).toBe(true)
+  expectTranslated(old)
+  for (const k of ['overnight', 'pre-market', 'regular', 'after close', 'daily break', 'weekend'] as const) expect(sessionText(k).en).toBe(k)
+  expectTranslated((['overnight', 'pre-market', 'regular', 'after close', 'daily break', 'weekend'] as const).map(sessionText))
 })

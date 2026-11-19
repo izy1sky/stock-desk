@@ -25,7 +25,8 @@
 //   option quotes stay at the close, so price-based reads (ATM IV, straddles,
 //   skew deltas) use the spot implied by put-call parity (`optionSpot`).
 
-import { biasOf, clampScore, type ModuleResult, type Reading } from './types'
+import { bi, biasText, joinText } from '../i18n'
+import { biasOf, clampScore, type ModuleResult, type Reading, type Text } from './types'
 import { getJson, num, type Fetch } from './http'
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -86,6 +87,11 @@ export type TermPoint = { expiry: string; days: number; iv: number }
 
 export type SkewRead = 'steep' | 'normal' | 'flat' | 'call skew'
 
+const SKEW_ZH: Record<SkewRead, string> = { steep: '陡峭', normal: '正常', flat: '平坦', 'call skew': '认购偏斜' }
+
+/** The 25-delta skew read in both languages. */
+export const skewReadText = (r: SkewRead): Text => bi(r, SKEW_ZH[r])
+
 export type SkewStats = {
   expiry: string
   days: number
@@ -119,7 +125,7 @@ export type GexStats = {
   flip?: number
   /** Total exposure on a grid of hypothetical spots (±10%, 0.25% steps). */
   profile: { spot: number; gex: number }[]
-  note: string
+  note: Text
 }
 
 export type MaxPain = { expiry: string; days: number; strike: number; monthly: boolean }
@@ -202,6 +208,15 @@ export type VolQuote = { value: number; change?: number; changePct?: number; pre
 
 export type VolRegime = 'contango (calm)' | 'flat' | 'backwardation (stress)'
 
+const VOL_REGIME_ZH: Record<VolRegime, string> = {
+  'contango (calm)': 'contango 升水，市场平静',
+  flat: '平坦',
+  'backwardation (stress)': 'backwardation 贴水，市场承压',
+}
+
+/** The VIX term-structure regime in both languages. */
+export const volRegimeText = (r: VolRegime): Text => bi(r, VOL_REGIME_ZH[r])
+
 export type VolIndexes = {
   asOf?: string
   vix?: VolQuote
@@ -250,8 +265,10 @@ const AM_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX', 'DJX'])
 /** Underlyings whose options trade in CBOE's global (overnight) session. */
 const GTH = new Set(['SPX', 'XSP', 'VIX'])
 
-const GEX_NOTE =
-  'Dealer gamma uses the common public convention (SqueezeMetrics-style): dealers are assumed long the calls and short the puts customers trade, so call GEX = +Γ·OI·100·S²·1% and put GEX = −Γ·OI·100·S²·1%, in $ of delta change per 1% move. Positive totals mean dealer hedging tends to damp moves; negative totals mean it tends to amplify them. It is an estimate: real dealer positions are not public.'
+const GEX_NOTE = bi(
+  'Dealer gamma uses the common public convention (SqueezeMetrics-style): dealers are assumed long the calls and short the puts customers trade, so call GEX = +Γ·OI·100·S²·1% and put GEX = −Γ·OI·100·S²·1%, in $ of delta change per 1% move. Positive totals mean dealer hedging tends to damp moves; negative totals mean it tends to amplify them. It is an estimate: real dealer positions are not public.',
+  '做市商伽马（GEX）采用公开市场的通用口径（SqueezeMetrics 式）：假定做市商持有客户所交易认购期权的多头、认沽期权的空头，因此认购 GEX = +Γ·OI·100·S²·1%，认沽 GEX = −Γ·OI·100·S²·1%，单位为标的每变动 1% 时的 delta 变化（美元）。总值为正，做市商对冲往往抑制波动；为负则往往放大波动。这只是估算：做市商的真实持仓并不公开。',
+)
 
 // ─── Symbols and parsing ──────────────────────────────────────────────────
 
@@ -974,7 +991,7 @@ const price = (x: number) =>
  */
 export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsModuleResult {
   const { spot, gex } = stats
-  const flags: string[] = []
+  const flags: Text[] = []
   let score = 0
 
   // Gamma regime
@@ -983,16 +1000,29 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
   if (positive) score += 10 + Math.min(10, Math.max(0, dist) * 500)
   else score -= 15 + Math.min(15, Math.max(0, -dist) * 750)
   const flipText = gex.flip !== undefined ? `${price(gex.flip)} flip` : 'flip'
-  if (!positive) flags.push(`Dealers look short gamma (${fmtGex(gex.total)} per 1%): hedging tends to amplify moves.`)
-  else if (gex.flip !== undefined && dist < 0.005) flags.push(`Spot is within 0.5% of the ${flipText}: the gamma cushion is thin.`)
+  const flipZh = gex.flip !== undefined ? `${price(gex.flip)} 伽马翻转点（gamma flip）` : '伽马翻转点（gamma flip）'
+  if (!positive)
+    flags.push(
+      bi(
+        `Dealers look short gamma (${fmtGex(gex.total)} per 1%): hedging tends to amplify moves.`,
+        `做市商看起来处于负伽马（每 1% ${fmtGex(gex.total)}）：对冲往往会放大波动。`,
+      ),
+    )
+  else if (gex.flip !== undefined && dist < 0.005)
+    flags.push(bi(`Spot is within 0.5% of the ${flipText}: the gamma cushion is thin.`, `现价距 ${flipZh}不到 0.5%：伽马缓冲很薄。`))
 
   // Skew
   if (stats.skew?.read === 'steep') {
     score -= 12
-    flags.push(`Steep put skew: 25Δ puts ${pct(stats.skew.skew)} over calls — heavy demand for crash protection.`)
+    flags.push(
+      bi(
+        `Steep put skew: 25Δ puts ${pct(stats.skew.skew)} over calls — heavy demand for crash protection.`,
+        `认沽偏斜陡峭：25Δ 认沽比认购高 ${pct(stats.skew.skew)}，防暴跌保护需求旺盛。`,
+      ),
+    )
   } else if (stats.skew?.read === 'call skew') {
     score += 4
-    flags.push('Call skew: upside calls are bid over puts — speculative chasing, can unwind fast.')
+    flags.push(bi('Call skew: upside calls are bid over puts — speculative chasing, can unwind fast.', '认购偏斜：上行认购期权比认沽更贵，投机追涨，可能很快回吐。'))
   }
 
   // Term structure
@@ -1000,7 +1030,7 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
   if (tr !== undefined) {
     if (tr >= 1.05) {
       score -= 12
-      flags.push(`Implied-vol term structure is inverted (9d/90d ${tr.toFixed(2)}): near-term stress is priced.`)
+      flags.push(bi(`Implied-vol term structure is inverted (9d/90d ${tr.toFixed(2)}): near-term stress is priced.`, `隐含波动率期限结构倒挂（9 日/90 日 ${tr.toFixed(2)}）：市场已为近期压力定价。`))
     } else if (tr >= 1) score -= 5
     else if (tr <= 0.85) score += 5
   }
@@ -1008,11 +1038,11 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
   // VIX backdrop
   if (vol?.regime === 'backwardation (stress)') {
     score -= 10
-    flags.push(`VIX is above VIX3M (${vol.vixToVix3m?.toFixed(2)}): market-wide volatility backwardation.`)
+    flags.push(bi(`VIX is above VIX3M (${vol.vixToVix3m?.toFixed(2)}): market-wide volatility backwardation.`, `VIX 高于 VIX3M（${vol.vixToVix3m?.toFixed(2)}）：全市场波动率贴水（backwardation）。`))
   } else if (vol?.regime === 'contango (calm)') score += 5
   if (vol?.vix9dToVix !== undefined && vol.vix9dToVix >= 1.1) {
     score -= 5
-    flags.push(`VIX9D is ${vol.vix9dToVix.toFixed(2)}× VIX: the coming week is priced as unusually risky.`)
+    flags.push(bi(`VIX9D is ${vol.vix9dToVix.toFixed(2)}× VIX: the coming week is priced as unusually risky.`, `VIX9D 是 VIX 的 ${vol.vix9dToVix.toFixed(2)} 倍：市场认为未来一周风险异常高。`))
   }
 
   // Put/call
@@ -1021,18 +1051,35 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
     if (rel >= 1.4) score += 8
     else if (rel <= 0.65) score -= 8
   }
-  if (stats.pcVolume !== undefined && stats.pcVolume >= 2) flags.push(`Put/call volume ${stats.pcVolume.toFixed(2)}: panic-level hedging (contrarian only in moderation; extremes can persist).`)
-  if (stats.pcVolume !== undefined && stats.pcVolume <= 0.4) flags.push(`Put/call volume ${stats.pcVolume.toFixed(2)}: very little hedging — complacency.`)
+  if (stats.pcVolume !== undefined && stats.pcVolume >= 2)
+    flags.push(
+      bi(
+        `Put/call volume ${stats.pcVolume.toFixed(2)}: panic-level hedging (contrarian only in moderation; extremes can persist).`,
+        `成交量 P/C ${stats.pcVolume.toFixed(2)}：恐慌级对冲（适度时才有反向意义，极端状态可能持续）。`,
+      ),
+    )
+  if (stats.pcVolume !== undefined && stats.pcVolume <= 0.4)
+    flags.push(bi(`Put/call volume ${stats.pcVolume.toFixed(2)}: very little hedging — complacency.`, `成交量 P/C ${stats.pcVolume.toFixed(2)}：几乎没人对冲，市场过于安逸。`))
 
   // Walls
   if (gex.callWall !== undefined && gex.callWall >= spot && (gex.callWall - spot) / spot <= 0.01) {
     score -= 5
-    flags.push(`Spot is just under the ${price(gex.callWall)} call wall: upside may stall there.`)
+    flags.push(bi(`Spot is just under the ${price(gex.callWall)} call wall: upside may stall there.`, `现价紧贴 ${price(gex.callWall)} 看涨墙（call wall）下方：上行可能在此受阻。`))
   }
   if (gex.putWall !== undefined && gex.putWall <= spot && (spot - gex.putWall) / spot <= 0.01) score += 5
 
   const top = stats.unusual[0]
-  if (top) flags.push(`Unusual volume: ${top.volume.toLocaleString('en-US')} ${price(top.strike)}${top.type} ${top.expiry} vs ${top.oi.toLocaleString('en-US')} OI (${fmtGex(top.premium).slice(1)} premium).`)
+  if (top) {
+    const vol = top.volume.toLocaleString('en-US')
+    const oi = top.oi.toLocaleString('en-US')
+    const prem = fmtGex(top.premium).slice(1)
+    flags.push(
+      bi(
+        `Unusual volume: ${vol} ${price(top.strike)}${top.type} ${top.expiry} vs ${oi} OI (${prem} premium).`,
+        `异常成交：${top.expiry} 到期 ${price(top.strike)}${top.type} 成交 ${vol} 张，未平仓量 ${oi} 张（权利金 ${prem}）。`,
+      ),
+    )
+  }
 
   const pain = stats.maxPain.monthly ?? stats.maxPain.nearest
   const levels: OptionsLevels = {
@@ -1044,29 +1091,94 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
 
   let confidence = stats.totalOi >= 1e6 ? 0.65 : stats.totalOi >= 2e5 ? 0.55 : stats.totalOi >= 5e4 ? 0.4 : 0.25
   if (stats.ivAtm30 === undefined || gex.flip === undefined) confidence -= 0.1
-  if (stats.totalOi < 5e4) flags.push(`Thin options market (${stats.totalOi.toLocaleString('en-US')} contracts open): positioning reads are unreliable.`)
+  if (stats.totalOi < 5e4)
+    flags.push(
+      bi(
+        `Thin options market (${stats.totalOi.toLocaleString('en-US')} contracts open): positioning reads are unreliable.`,
+        `期权市场清淡（未平仓 ${stats.totalOi.toLocaleString('en-US')} 张）：持仓解读不可靠。`,
+      ),
+    )
 
   const final = clampScore(score)
+  const flipAt = gex.flip !== undefined ? price(gex.flip) : undefined
   const regime = positive
-    ? `dealers look long gamma${gex.flip !== undefined ? ` above the ${price(gex.flip)} flip` : ''}, which tends to damp moves`
-    : `dealers look short gamma${gex.flip !== undefined ? ` below the ${price(gex.flip)} flip` : ''}, which tends to amplify moves`
-  const walls = [gex.callWall !== undefined ? `call wall ${price(gex.callWall)}` : '', gex.putWall !== undefined ? `put wall ${price(gex.putWall)}` : ''].filter(Boolean).join(', ')
-  const verdict = `Options positioning reads ${biasOf(final)}: ${regime}${walls ? `; ${walls}` : ''}.`
+    ? bi(
+        `dealers look long gamma${flipAt !== undefined ? ` above the ${flipAt} flip` : ''}, which tends to damp moves`,
+        `做市商${flipAt !== undefined ? `在 ${flipAt} 伽马翻转点（gamma flip）上方` : ''}看起来处于正伽马，往往会抑制波动`,
+      )
+    : bi(
+        `dealers look short gamma${flipAt !== undefined ? ` below the ${flipAt} flip` : ''}, which tends to amplify moves`,
+        `做市商${flipAt !== undefined ? `在 ${flipAt} 伽马翻转点（gamma flip）下方` : ''}看起来处于负伽马，往往会放大波动`,
+      )
+  const walls = joinText(
+    [
+      gex.callWall !== undefined ? bi(`call wall ${price(gex.callWall)}`, `看涨墙（call wall）${price(gex.callWall)}`) : undefined,
+      gex.putWall !== undefined ? bi(`put wall ${price(gex.putWall)}`, `看跌墙（put wall）${price(gex.putWall)}`) : undefined,
+    ].filter((x): x is Text => x !== undefined),
+    ', ',
+    '，',
+  )
+  const bias = biasOf(final)
+  const verdict = bi(
+    `Options positioning reads ${bias}: ${regime.en}${walls.en ? `; ${walls.en}` : ''}.`,
+    `期权持仓信号${biasText(bias).zh}：${regime.zh}${walls.zh ? `；${walls.zh}` : ''}。`,
+  )
 
   const readings: Reading[] = []
-  if (stats.pcVolume !== undefined) readings.push({ name: 'Put/call (volume)', value: Number(stats.pcVolume.toFixed(2)), note: rel === undefined ? undefined : rel >= 1.4 ? 'fearful flow' : rel <= 0.65 ? 'call-heavy flow' : 'normal flow' })
-  if (stats.pcOi !== undefined) readings.push({ name: 'Put/call (open interest)', value: Number(stats.pcOi.toFixed(2)) })
-  if (stats.ivAtm30 !== undefined) readings.push({ name: 'ATM IV 30d', value: pct(stats.ivAtm30) })
-  if (tr !== undefined) readings.push({ name: 'IV term 9d/90d', value: Number(tr.toFixed(2)), note: tr >= 1.05 ? 'inverted' : tr >= 1 ? 'flat' : 'upward sloping' })
-  if (stats.skew) readings.push({ name: `25Δ skew (${stats.skew.days}d)`, value: `${(stats.skew.skew * 100).toFixed(1)} pts`, note: stats.skew.read })
-  readings.push({ name: 'Dealer gamma', value: fmtGex(gex.total), note: positive ? 'long gamma: damping' : 'short gamma: amplifying' })
-  if (gex.flip !== undefined) readings.push({ name: 'Gamma flip', value: price(gex.flip), note: `spot ${dist >= 0 ? 'above' : 'below'} by ${pct(Math.abs(dist))}` })
-  if (gex.callWall !== undefined) readings.push({ name: 'Call wall', value: price(gex.callWall), note: `${pct((gex.callWall - spot) / spot)} away` })
-  if (gex.putWall !== undefined) readings.push({ name: 'Put wall', value: price(gex.putWall), note: `${pct((gex.putWall - spot) / spot)} away` })
-  if (pain) readings.push({ name: `Max pain ${pain.expiry}`, value: price(pain.strike), note: `${pct((pain.strike - spot) / spot)} from spot` })
+  if (stats.pcVolume !== undefined)
+    readings.push({
+      name: bi('Put/call (volume)', '认沽/认购比（成交量）'),
+      value: Number(stats.pcVolume.toFixed(2)),
+      note:
+        rel === undefined
+          ? undefined
+          : rel >= 1.4
+            ? bi('fearful flow', '资金偏恐慌')
+            : rel <= 0.65
+              ? bi('call-heavy flow', '认购成交偏多')
+              : bi('normal flow', '资金流正常'),
+    })
+  if (stats.pcOi !== undefined) readings.push({ name: bi('Put/call (open interest)', '认沽/认购比（未平仓量）'), value: Number(stats.pcOi.toFixed(2)) })
+  if (stats.ivAtm30 !== undefined) readings.push({ name: bi('ATM IV 30d', '平值 IV（30 日）'), value: pct(stats.ivAtm30) })
+  if (tr !== undefined)
+    readings.push({
+      name: bi('IV term 9d/90d', 'IV 期限结构 9 日/90 日'),
+      value: Number(tr.toFixed(2)),
+      note: tr >= 1.05 ? bi('inverted', '倒挂') : tr >= 1 ? bi('flat', '平坦') : bi('upward sloping', '向上倾斜'),
+    })
+  if (stats.skew) {
+    const pts = (stats.skew.skew * 100).toFixed(1)
+    readings.push({ name: bi(`25Δ skew (${stats.skew.days}d)`, `25Δ 偏斜（${stats.skew.days} 日）`), value: bi(`${pts} pts`, `${pts} 个百分点`), note: skewReadText(stats.skew.read) })
+  }
+  readings.push({
+    name: bi('Dealer gamma', '做市商伽马（GEX）'),
+    value: fmtGex(gex.total),
+    note: positive ? bi('long gamma: damping', '正伽马：抑制波动') : bi('short gamma: amplifying', '负伽马：放大波动'),
+  })
+  if (gex.flip !== undefined)
+    readings.push({
+      name: bi('Gamma flip', '伽马翻转点（gamma flip）'),
+      value: price(gex.flip),
+      note: bi(`spot ${dist >= 0 ? 'above' : 'below'} by ${pct(Math.abs(dist))}`, `现价${dist >= 0 ? '高于' : '低于'}该点 ${pct(Math.abs(dist))}`),
+    })
+  if (gex.callWall !== undefined)
+    readings.push({ name: bi('Call wall', '看涨墙（call wall）'), value: price(gex.callWall), note: bi(`${pct((gex.callWall - spot) / spot)} away`, `距现价 ${pct((gex.callWall - spot) / spot)}`) })
+  if (gex.putWall !== undefined)
+    readings.push({ name: bi('Put wall', '看跌墙（put wall）'), value: price(gex.putWall), note: bi(`${pct((gex.putWall - spot) / spot)} away`, `距现价 ${pct((gex.putWall - spot) / spot)}`) })
+  if (pain)
+    readings.push({
+      name: bi(`Max pain ${pain.expiry}`, `最大痛点（max pain）${pain.expiry}`),
+      value: price(pain.strike),
+      note: bi(`${pct((pain.strike - spot) / spot)} from spot`, `距现价 ${pct((pain.strike - spot) / spot)}`),
+    })
   const move = stats.expectedMoves.find(m => m.monthly) ?? stats.expectedMoves[0]
-  if (move) readings.push({ name: `Expected move to ${move.expiry}`, value: `±${move.pct.toFixed(1)}%`, note: `${price(move.lo)}–${price(move.hi)}` })
-  if (vol?.vix) readings.push({ name: 'VIX', value: Number(vol.vix.value.toFixed(2)), ...(vol.regime ? { note: vol.regime } : {}) })
+  if (move)
+    readings.push({
+      name: bi(`Expected move to ${move.expiry}`, `至 ${move.expiry} 的预期波幅`),
+      value: `±${move.pct.toFixed(1)}%`,
+      note: bi(`${price(move.lo)}–${price(move.hi)}`, `区间 ${price(move.lo)}–${price(move.hi)}`),
+    })
+  if (vol?.vix) readings.push({ name: bi('VIX', 'VIX 恐慌指数'), value: Number(vol.vix.value.toFixed(2)), ...(vol.regime ? { note: volRegimeText(vol.regime) } : {}) })
 
   return { key: 'options', score: final, confidence: Math.max(0.1, confidence), verdict, readings: readings.map(clean), flags, stats, levels }
 }

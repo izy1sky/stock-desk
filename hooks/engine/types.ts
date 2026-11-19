@@ -3,15 +3,20 @@
 // pane and the tests all run the same code.
 
 import type { Bar } from '../../types'
+import type { Text } from '../i18n'
 
-export type { Bar }
+export type { Bar, Text }
 
-/** One measured value, with what it says. `value` is the number or short text shown. */
+/**
+ * One measured value, with what it says, in both languages. `value` is the
+ * number, a formatted figure that needs no translation ("7,431.75", "23.1%"),
+ * or a Text pair when it holds words.
+ */
 export type Reading = {
-  name: string
-  value: number | string
-  /** Short interpretation, e.g. "bullish stack", "92nd percentile". */
-  note?: string
+  name: Text
+  value: number | string | Text
+  /** Short interpretation, e.g. "bullish stack" / "多头排列". */
+  note?: Text
 }
 
 export type ModuleKey = 'trend' | 'volatility' | 'volume' | 'options' | 'futures'
@@ -30,10 +35,10 @@ export type ModuleResult = {
   /** 0..1: how much this module's score should be trusted right now. */
   confidence: number
   /** One sentence: the module's conclusion. */
-  verdict: string
+  verdict: Text
   readings: Reading[]
   /** Notable conditions worth calling out, most important first. */
-  flags: string[]
+  flags: Text[]
 }
 
 /** Price levels the forecast uses; nearest first in each list. */

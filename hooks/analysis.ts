@@ -1,4 +1,6 @@
 import type { Bar, Range } from '../types'
+import { tr } from './i18n'
+import type { Lang } from './i18n'
 
 export const RANGE_BARS: Record<Range, number> = { '1M': 21, '3M': 63, '6M': 126, '1Y': 252, '2Y': 504 }
 
@@ -127,29 +129,41 @@ function spaced(points: Point[], gap: number): Point[] {
 const pct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`
 const money = (n: number) => n.toFixed(n >= 1000 ? 0 : 2)
 
-function classifyTrend(close: number, m50: number | null, m200: number | null, slope50: number | null): Trend {
-  if (m50 === null) return { label: 'Not enough history', tone: 'info', detail: 'Fewer than 50 trading days of data.' }
-  const rising = (slope50 ?? 0) > 0
-  if (m200 === null) {
-    return close > m50
-      ? { label: 'Above 50-day average', tone: 'good', detail: 'Short history: no 200-day average yet.' }
-      : { label: 'Below 50-day average', tone: 'warn', detail: 'Short history: no 200-day average yet.' }
-  }
-  if (close > m50 && m50 > m200 && rising)
-    return { label: 'Uptrend', tone: 'good', detail: 'Price above a rising 50-day average, which is above the 200-day.' }
-  if (close < m50 && m50 > m200 && close > m200)
-    return { label: 'Pullback in an uptrend', tone: 'info', detail: 'Below the 50-day average but the long-term (200-day) trend is still up.' }
-  if (close < m50 && m50 < m200 && !rising)
-    return { label: 'Downtrend', tone: 'risk', detail: 'Price below a falling 50-day average, which is below the 200-day.' }
-  if (close > m50 && m50 < m200)
-    return { label: 'Rebound in a downtrend', tone: 'warn', detail: 'Back above the 50-day average, but still under the 200-day.' }
-  if (close < m200)
-    return { label: 'Below long-term trend', tone: 'warn', detail: 'Price is under its 200-day average.' }
+/** A YYYY-MM-DD date as written in the text: unchanged in English, "2026年3月4日" in Chinese. */
+export function fullDate(lang: Lang, iso: string): string {
+  if (lang !== 'zh') return iso
+  const [y, m, d] = iso.split('-')
 
-  return { label: 'Sideways', tone: 'info', detail: 'Averages are flat or crossing; no clear direction.' }
+  return `${Number(y)}年${Number(m)}月${Number(d)}日`
 }
 
-export function analyze(bars: Bar[], range: Range, earningsInDays?: number): Analysis | undefined {
+function classifyTrend(close: number, m50: number | null, m200: number | null, slope50: number | null, lang: Lang): Trend {
+  const t = (en: string, zh: string) => tr(lang, en, zh)
+  if (m50 === null) return { label: t('Not enough history', '历史数据不足'), tone: 'info', detail: t('Fewer than 50 trading days of data.', '数据不足 50 个交易日。') }
+  const rising = (slope50 ?? 0) > 0
+  if (m200 === null) {
+    const short = t('Short history: no 200-day average yet.', '历史较短：还没有 200 日均线。')
+
+    return close > m50
+      ? { label: t('Above 50-day average', '位于 50 日均线上方'), tone: 'good', detail: short }
+      : { label: t('Below 50-day average', '位于 50 日均线下方'), tone: 'warn', detail: short }
+  }
+  if (close > m50 && m50 > m200 && rising)
+    return { label: t('Uptrend', '上升趋势'), tone: 'good', detail: t('Price above a rising 50-day average, which is above the 200-day.', '股价位于上行的 50 日均线上方，50 日均线又在 200 日均线上方。') }
+  if (close < m50 && m50 > m200 && close > m200)
+    return { label: t('Pullback in an uptrend', '上升趋势中的回调'), tone: 'info', detail: t('Below the 50-day average but the long-term (200-day) trend is still up.', '跌破 50 日均线，但长期（200 日）趋势仍然向上。') }
+  if (close < m50 && m50 < m200 && !rising)
+    return { label: t('Downtrend', '下降趋势'), tone: 'risk', detail: t('Price below a falling 50-day average, which is below the 200-day.', '股价位于下行的 50 日均线下方，50 日均线又在 200 日均线下方。') }
+  if (close > m50 && m50 < m200)
+    return { label: t('Rebound in a downtrend', '下降趋势中的反弹'), tone: 'warn', detail: t('Back above the 50-day average, but still under the 200-day.', '重回 50 日均线上方，但仍在 200 日均线下方。') }
+  if (close < m200)
+    return { label: t('Below long-term trend', '低于长期趋势'), tone: 'warn', detail: t('Price is under its 200-day average.', '股价位于 200 日均线下方。') }
+
+  return { label: t('Sideways', '横盘'), tone: 'info', detail: t('Averages are flat or crossing; no clear direction.', '均线走平或相互交叉，方向不明。') }
+}
+
+export function analyze(bars: Bar[], range: Range, earningsInDays?: number, lang: Lang = 'en'): Analysis | undefined {
+  const t = (en: string, zh: string) => tr(lang, en, zh)
   if (bars.length < 2) return undefined
   const closes = bars.map(b => b.c)
   const last = bars[bars.length - 1]!
@@ -200,7 +214,7 @@ export function analyze(bars: Bar[], range: Range, earningsInDays?: number): Ana
   const atrValue = atr(bars)
   const moveVsAtr = atrValue ? Math.abs(change) / atrValue : undefined
   const rsiValue = rsi(closes)
-  const trend = classifyTrend(last.c, m50, m200, slope50)
+  const trend = classifyTrend(last.c, m50, m200, slope50, lang)
 
   const insights: Insight[] = []
   const isDown = change < 0
@@ -209,53 +223,90 @@ export function analyze(bars: Bar[], range: Range, earningsInDays?: number): Ana
     const tone: Tone = drawdown >= 20 ? 'risk' : drawdown >= 10 ? 'warn' : 'info'
     insights.push({
       tone,
-      text: `${drawdown.toFixed(1)}% below its 52-week high of $${money(high52.price)} (${high52.date}).${drawdown >= 20 ? ' That is bear-market territory for this stock.' : ''} For scale, its deepest peak-to-trough fall in the past year (on closing prices) was ${maxDrawdown1y.toFixed(1)}%.`,
+      text: t(
+        `${drawdown.toFixed(1)}% below its 52-week high of $${money(high52.price)} (${high52.date}).${drawdown >= 20 ? ' That is bear-market territory for this stock.' : ''} For scale, its deepest peak-to-trough fall in the past year (on closing prices) was ${maxDrawdown1y.toFixed(1)}%.`,
+        `较 52 周高点 $${money(high52.price)}（${fullDate(lang, high52.date)}）低 ${drawdown.toFixed(1)}%。${drawdown >= 20 ? '对这只股票来说，已进入熊市区间。' : ''}作为参照，过去一年最深的一次高点到低点回撤（按收盘价）是 ${maxDrawdown1y.toFixed(1)}%。`,
+      ),
     })
   } else {
-    insights.push({ tone: 'good', text: `Within 1% of its 52-week high ($${money(high52.price)}).` })
+    insights.push({ tone: 'good', text: t(`Within 1% of its 52-week high ($${money(high52.price)}).`, `距 52 周高点（$${money(high52.price)}）不到 1%。`) })
   }
 
   if (isDown && moveVsAtr !== undefined) {
     if (moveVsAtr >= 2)
-      insights.push({ tone: 'risk', text: `Last session's drop (${pct(changePct)}) was ${moveVsAtr.toFixed(1)}× a normal day's range. Moves this large are usually news-driven: check the News tab before reacting.` })
+      insights.push({
+        tone: 'risk',
+        text: t(
+          `Last session's drop (${pct(changePct)}) was ${moveVsAtr.toFixed(1)}× a normal day's range. Moves this large are usually news-driven: check the News tab before reacting.`,
+          `上一交易日的跌幅（${pct(changePct)}）是正常日波幅的 ${moveVsAtr.toFixed(1)}×。这么大的波动通常由消息驱动：先看看“新闻”标签页再做反应。`,
+        ),
+      })
     else if (moveVsAtr >= 1)
-      insights.push({ tone: 'warn', text: `Last session's drop (${pct(changePct)}) was bigger than a typical day (${moveVsAtr.toFixed(1)}× its average range).` })
+      insights.push({
+        tone: 'warn',
+        text: t(`Last session's drop (${pct(changePct)}) was bigger than a typical day (${moveVsAtr.toFixed(1)}× its average range).`, `上一交易日的跌幅（${pct(changePct)}）大于平常（是平均日波幅的 ${moveVsAtr.toFixed(1)}×）。`),
+      })
     else
-      insights.push({ tone: 'info', text: `Last session's move (${pct(changePct)}) is within its normal daily range (~$${money(atrValue!)}).` })
+      insights.push({ tone: 'info', text: t(`Last session's move (${pct(changePct)}) is within its normal daily range (~$${money(atrValue!)}).`, `上一交易日的涨跌（${pct(changePct)}）在正常日波幅之内（约 $${money(atrValue!)}）。`) })
   }
 
-  if (downStreak >= 3) insights.push({ tone: 'warn', text: `Down ${downStreak} sessions in a row.` })
+  if (downStreak >= 3) insights.push({ tone: 'warn', text: t(`Down ${downStreak} sessions in a row.`, `连续 ${downStreak} 个交易日下跌。`) })
 
   if (isDown && volumeRatio !== undefined) {
     if (volumeRatio >= 1.5)
-      insights.push({ tone: 'risk', text: `Fell on heavy volume (${volumeRatio.toFixed(1)}× the 50-day average): broad, determined selling.` })
+      insights.push({ tone: 'risk', text: t(`Fell on heavy volume (${volumeRatio.toFixed(1)}× the 50-day average): broad, determined selling.`, `放量下跌（成交量是 50 日均量的 ${volumeRatio.toFixed(1)}×）：抛售广泛而坚决。`) })
     else if (volumeRatio < 0.8)
-      insights.push({ tone: 'info', text: `Fell on light volume (${volumeRatio.toFixed(1)}× average): selling pressure looks limited.` })
+      insights.push({ tone: 'info', text: t(`Fell on light volume (${volumeRatio.toFixed(1)}× average): selling pressure looks limited.`, `缩量下跌（成交量是均量的 ${volumeRatio.toFixed(1)}×）：抛压看起来有限。`) })
   }
 
   if (rsiValue !== undefined) {
     if (rsiValue <= 30)
-      insights.push({ tone: 'warn', text: `RSI ${rsiValue.toFixed(0)}: oversold. Bounces are common from here, but in a downtrend a stock can stay oversold for weeks.` })
+      insights.push({
+        tone: 'warn',
+        text: t(
+          `RSI ${rsiValue.toFixed(0)}: oversold. Bounces are common from here, but in a downtrend a stock can stay oversold for weeks.`,
+          `RSI ${rsiValue.toFixed(0)}：超卖。从这里反弹很常见，但在下降趋势中，股票可能连续数周处于超卖状态。`,
+        ),
+      })
     else if (rsiValue >= 70)
-      insights.push({ tone: 'warn', text: `RSI ${rsiValue.toFixed(0)}: overbought. Short pullbacks are common after readings this high.` })
+      insights.push({ tone: 'warn', text: t(`RSI ${rsiValue.toFixed(0)}: overbought. Short pullbacks are common after readings this high.`, `RSI ${rsiValue.toFixed(0)}：超买。读数这么高之后，短暂回调很常见。`) })
   }
 
   if (m200 !== null && last.c < m200)
-    insights.push({ tone: 'risk', text: `Below its 200-day average ($${money(m200)}). Buying dips below the long-term trend line is generally riskier than buying dips above it.` })
+    insights.push({
+      tone: 'risk',
+      text: t(
+        `Below its 200-day average ($${money(m200)}). Buying dips below the long-term trend line is generally riskier than buying dips above it.`,
+        `位于 200 日均线（$${money(m200)}）下方。在长期趋势线下方逢低买入，通常比在其上方逢低买入风险更大。`,
+      ),
+    })
   else if (m50 !== null && last.c < m50 && trend.tone !== 'risk')
-    insights.push({ tone: 'info', text: `Below its 50-day average ($${money(m50)}) but above the 200-day: a pullback, not (yet) a broken trend.` })
+    insights.push({ tone: 'info', text: t(`Below its 50-day average ($${money(m50)}) but above the 200-day: a pullback, not (yet) a broken trend.`, `位于 50 日均线（$${money(m50)}）下方，但仍在 200 日均线上方：属于回调，趋势（暂时）没有被破坏。`) })
 
   const s1 = supports[0]
   if (s1) {
     const gap = ((last.c - s1.price) / last.c) * 100
     const kind = s1 === low52 ? '52-week low' : 'swing low'
-    insights.push({ tone: 'info', text: `Nearest support: $${money(s1.price)} (${kind} on ${s1.date}), ${gap.toFixed(1)}% below. A close under it would open the way to ${supports[1] ? `$${money(supports[1].price)}` : `the 52-week low ($${money(low52.price)})`}.` })
+    const kindZh = s1 === low52 ? '52 周低点' : '波段低点'
+    insights.push({
+      tone: 'info',
+      text: t(
+        `Nearest support: $${money(s1.price)} (${kind} on ${s1.date}), ${gap.toFixed(1)}% below. A close under it would open the way to ${supports[1] ? `$${money(supports[1].price)}` : `the 52-week low ($${money(low52.price)})`}.`,
+        `最近的支撑：$${money(s1.price)}（${fullDate(lang, s1.date)}的${kindZh}），在现价下方 ${gap.toFixed(1)}%。收盘跌破它，下一个看点是 ${supports[1] ? `$${money(supports[1].price)}` : `52 周低点（$${money(low52.price)}）`}。`,
+      ),
+    })
   } else {
-    insights.push({ tone: 'risk', text: `No support below: price is at a new 52-week low ($${money(low52.price)}), with no recent level to lean on.` })
+    insights.push({ tone: 'risk', text: t(`No support below: price is at a new 52-week low ($${money(low52.price)}), with no recent level to lean on.`, `下方没有支撑：股价处于 52 周新低（$${money(low52.price)}），近期没有可依托的价位。`) })
   }
 
   if (earningsInDays !== undefined && earningsInDays <= 10)
-    insights.push({ tone: 'warn', text: earningsInDays <= 0 ? 'Earnings are out today: expect a large gap either way.' : `Earnings in ${earningsInDays} day${earningsInDays === 1 ? '' : 's'}: price can gap past any support level.` })
+    insights.push({
+      tone: 'warn',
+      text:
+        earningsInDays <= 0
+          ? t('Earnings are out today: expect a large gap either way.', '今天发布财报：预计会大幅跳空，方向不定。')
+          : t(`Earnings in ${earningsInDays} day${earningsInDays === 1 ? '' : 's'}: price can gap past any support level.`, `${earningsInDays} 天后发布财报：股价可能跳空越过任何支撑位。`),
+    })
 
   return {
     last,

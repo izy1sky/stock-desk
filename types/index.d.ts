@@ -30,6 +30,8 @@ export type Prefs = {
   showRules?: boolean
   /** Hover tooltips on the expanded chart's candles; off by default, as they hold the scroll wheel. */
   hoverCandles?: boolean
+  /** The language the panes are written in (default English). */
+  lang?: 'en' | 'zh'
   /** The analysis horizon, in trading days. */
   horizon?: number
   /** Set once the Analysis tab has been opened for the person on first load. */
