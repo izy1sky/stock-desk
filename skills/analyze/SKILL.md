@@ -16,12 +16,14 @@ The stock-desk mod computes the numbers; your job is to read them critically and
 | `mcp__stock-desk__options_positioning` `{ symbol }` | The options detail alone: P/C, ATM term structure, 25Δ skew, GEX and the gamma flip, call/put walls, max pain, expected move per expiry, unusual volume. |
 | `mcp__stock-desk__beta_map` `{ base, targets, baseTarget? , baseMovePct?, lookback? }` | "If SPX goes to 7500, where are SOXL and TQQQ?" — regression beta with a ±1σ residual band per target. |
 | `mcp__stock-desk__probability` `{ symbol, levels, days }` | Model probability of closing above / touching given levels within N trading days (lognormal on implied vol, or realized vol when no options). |
+| `mcp__stock-desk__intraday_read` `{ symbol }` | Today's session in real time: gap and pre-market, 5/15/30-minute opening ranges and the first-hour range (initial balance) with breakout status, VWAP and bands, relative volume by time of day, the opening type, sector breadth and leadership, VIX, today's options levels, a lean for the rest of the day, and past sessions that looked like today at the same clock time. |
 
 The tools also put the result in the stock-desk pane (Analysis tab), so the person can see it beside the chat.
 
 ## Workflow
 
-1. **Pin down the question.** Ticker(s) and horizon: intraday/next session, swing (1–4 weeks) or position (months). Pass the horizon in trading days; the composite weights depend on it (short horizons lean on futures, options and volume; longer ones on trend).
+1. **Pin down the question.** "Today", "this morning", "the open", "the first hour", "right now" or any question during market hours about where the day is going → **intraday**: call `intraday_read` (and `market_overview` for context; for a single stock also `intraday_read` on SPY or QQQ). Days to weeks → the daily read with `analyze_ticker`. A question that mixes both ("today and this week") gets both, the intraday read first.
+1b. **For the daily read, pin down the horizon.** Ticker(s) and horizon: intraday/next session, swing (1–4 weeks) or position (months). Pass the horizon in trading days; the composite weights depend on it (short horizons lean on futures, options and volume; longer ones on trend).
 2. **Get context first when it matters.** For an index, index ETF, leveraged ETF or a high-beta name, call `market_overview` as well: a stock's read means little against a market that is breaking down.
 3. **Read every module, not just the composite.** For each one note its score, confidence and flags. Then check agreement:
    - modules that agree → higher conviction;
@@ -32,6 +34,15 @@ The tools also put the result in the stock-desk pane (Analysis tab), so the pers
    - Direction comes from the module scores and the analog study. Quote the analog sample size and compare its win rate with the baseline; with n < 20, or a win rate within ~5 points of the baseline, call the edge weak.
    - Never present a model probability as a prediction of what will happen.
 5. **Check freshness.** Quotes are ~15 minutes delayed; options and vol indexes are CBOE delayed; COT is as of the prior Tuesday. If a source failed, the tool says so — say it too, and do not fill the gap with guesses.
+
+## Reading the intraday tool
+
+- **Phase first.** Before 09:30 it is a pre-market read (gap, futures, levels to watch at the bell). From 09:30 to 10:30 the opening ranges are still forming: say so and keep the confidence modest; the read firms up once the first-hour range (initial balance) completes at 10:30.
+- **What usually decides the day:** where price sits against VWAP and the first-hour range, whether a gap is being followed through or filled, the opening type (an open-drive that holds is the strongest trend signal; rejection-reverse warns), and relative volume (a breakout on heavy volume counts, on light volume often fails).
+- **Breadth:** a move carried by a few sectors (RSP lagging SPY, most sectors down while tech is up) is narrower and less reliable than a broad one. There is no NYSE TICK or advance/decline feed; breadth is the sector-ETF proxy.
+- **Options:** above the gamma flip, dealer hedging tends to damp moves and pin toward big strikes (max pain, walls); below it, moves stretch. Today's straddle move is the range the market priced for the day.
+- **The session study** compares today's state with ~70 past sessions (and the kept archive) at the same clock time. Quote n and the baseline; with n < 15 call it anecdotal.
+- **Give levels, not timing.** Name the trigger levels for each scenario (e.g. "a 5-minute close above the first-hour high at …") and what invalidates it. Never say what the person should do with their positions.
 
 ## Answer format
 

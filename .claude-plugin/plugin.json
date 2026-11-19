@@ -1,6 +1,6 @@
 {
   "name": "stock-desk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Stock analysis engine and pane: trend, volatility, volume flow, options positioning (gamma, skew, walls), index futures and COT, scored into a bias with scenarios, model odds and historical analogs",
   "author": {
     "name": "izy1sky"

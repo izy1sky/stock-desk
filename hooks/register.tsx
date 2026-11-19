@@ -17,6 +17,9 @@ import type { SkewRead } from './engine/options'
 import { fmtPrice, levelKindText } from './engine/technicals'
 import { agoText, biasText, dayLabel as dayLabelIn, etTime, LANGS, pick, relativeDays, tr } from './i18n'
 import type { Lang } from './i18n'
+import { analyzeIntraday, buildIntraday, intradayMarkdown, levelKindTextIntraday, loadBreadth, loadIntraday, openTypeText, phaseText, rangeStatusText, summarizeDay } from './engine/intraday'
+import type { Breadth, DaySummary, IntradayData, IntradayRead, OptionsContext } from './engine/intraday'
+import { intradayChart } from './intraday-chart'
 import { chartPage } from './page'
 import { applyCommand, EMPTY_PORTFOLIO, parseCommand, RULE_LABELS, ruleText as ruleTextIn, runChecks, sizePosition, valuePortfolio } from './portfolio'
 
@@ -62,6 +65,8 @@ const busy = atom({ plugin: 'stock-desk', key: 'busy' } as const, [])
 // reports-2: verdicts, readings, flags and scenario text are { en, zh } pairs.
 const reports = atom({ plugin: 'stock-desk', key: 'reports' } as const, {}, { shape: 'reports-2' })
 const reportErrors = atom({ plugin: 'stock-desk', key: 'reportErrors' } as const, {})
+const intraday = atom({ plugin: 'stock-desk', key: 'intraday' } as const, {}, { shape: 'intraday-1' })
+const intradayErrors = atom({ plugin: 'stock-desk', key: 'intradayErrors' } as const, {})
 
 type $ = EngineInterface
 
@@ -277,6 +282,173 @@ async function refreshShownReport($: $, force = false): Promise<void> {
 }
 
 // A registered tool answers with its text as `result`; `isError` sits beside it.
+// ---------- intraday ----------
+
+/** What the intraday tab keeps per ticker: the read and the minute bars the chart draws. */
+type IntradayEntry = { symbol: string; fetchedAt: number; read: IntradayRead; bars: IntradayData['bars'] }
+
+const intradayOf = async ($: $, symbol: string) => (await read($, intraday))[symbol] as IntradayEntry | undefined
+
+let breadthCache: Breadth | undefined
+let breadthAt = 0
+const optionsCache = new Map<string, { at: number; ctx?: OptionsContext }>()
+const ARCHIVE_KEY = 'intradayArchive'
+const ARCHIVE_DAYS = 400
+
+/** Minutes since midnight in New York, and whether it is a weekday. */
+function nyClock(now = Date.now()): { minutes: number; weekday: boolean } {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false, weekday: 'short' }).formatToParts(new Date(now))
+    const get = (type: string) => parts.find(x => x.type === type)?.value ?? ''
+    const day = get('weekday')
+
+    return { minutes: (Number(get('hour')) % 24) * 60 + Number(get('minute')), weekday: day !== 'Sat' && day !== 'Sun' }
+  } catch {
+    const d = new Date(now - 5 * 3600_000)
+
+    return { minutes: d.getUTCHours() * 60 + d.getUTCMinutes(), weekday: d.getUTCDay() !== 0 && d.getUTCDay() !== 6 }
+  }
+}
+
+/** How often the intraday read refreshes now: every minute in the first hour, then every 3; 5 pre-market; 15 after hours. */
+function intradayCadenceMs(now = Date.now()): number | undefined {
+  const { minutes, weekday } = nyClock(now)
+  if (!weekday) return undefined
+  if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) return 5 * 60_000
+  if (minutes >= 9 * 60 + 30 && minutes < 10 * 60 + 30) return 60_000
+  if (minutes >= 10 * 60 + 30 && minutes < 16 * 60) return 3 * 60_000
+  if (minutes >= 16 * 60 && minutes < 20 * 60) return 15 * 60_000
+
+  return undefined
+}
+
+async function breadthNow($: $): Promise<Breadth | undefined> {
+  if (breadthCache && Date.now() - breadthAt < 60_000) return breadthCache
+  try {
+    breadthCache = await loadBreadth(fetcher($))
+    breadthAt = Date.now()
+  } catch {
+    // Breadth is context: the read goes on without it and says so.
+  }
+
+  return breadthCache
+}
+
+/** Gamma flip, walls, max pain and today's straddle move: the option chain is large, so it reloads every 10 minutes at most. */
+async function optionsContext($: $, symbol: string): Promise<OptionsContext | undefined> {
+  const have = optionsCache.get(symbol)
+  if (have && Date.now() - have.at < 10 * 60_000) return have.ctx
+  try {
+    const { summary } = await buildOptions(fetcher($), symbol, marketCache?.vol)
+    const m = summary.moves[0]
+    const ctx: OptionsContext = {
+      gammaFlip: summary.levels.gammaFlip,
+      callWall: summary.levels.callWall,
+      putWall: summary.levels.putWall,
+      maxPain: summary.maxPainNearest?.strike,
+      todayMove: m ? { expiry: m.expiry, pct: m.pct, lo: m.lo, hi: m.hi } : undefined,
+    }
+    optionsCache.set(symbol, { at: Date.now(), ctx })
+
+    return ctx
+  } catch {
+    optionsCache.set(symbol, { at: Date.now(), ctx: undefined })
+
+    return undefined
+  }
+}
+
+async function readArchive($: $): Promise<Record<string, DaySummary[]>> {
+  // The archive only adds sessions to the study: an unreadable store never blocks the read.
+  try {
+    const saved = (await $.store.get(ARCHIVE_KEY)) as Record<string, DaySummary[]> | undefined
+
+    return saved && typeof saved === 'object' ? saved : {}
+  } catch {
+    return {}
+  }
+}
+
+/** After the close, keeps the session's summary so the session study grows past what the feed keeps. */
+async function archiveDay($: $, symbol: string, data: IntradayData): Promise<void> {
+  const day = summarizeDay(data)
+  if (!day) return
+  const archive = await readArchive($)
+  const list = archive[symbol] ?? []
+  if (list.some(d => d.date === day.date)) return
+  archive[symbol] = [...list, day].slice(-ARCHIVE_DAYS)
+  await $.store.set(ARCHIVE_KEY, archive)
+}
+
+/** Toasts for the moments that change the day's read, when the person turned alerts on. */
+async function intradayAlerts($: $, before: IntradayRead | undefined, now: IntradayRead): Promise<void> {
+  const p = await read($, prefs)
+  if (!p.intradayAlerts || !before || before.sessionDate !== now.sessionDate) return
+  const lang = langOf(p)
+  const L = (en: string, zh: string) => tr(lang, en, zh)
+  const s = now.symbol
+  const ib = (r: IntradayRead) => r.ranges.find(x => x.minutes === 60)
+  const out: string[] = []
+  const ibBefore = ib(before)
+  const ibNow = ib(now)
+  if (ibNow?.complete && !ibBefore?.complete)
+    out.push(L(`${s} first hour done: range ${fmtPrice(ibNow.low)}–${fmtPrice(ibNow.high)}, ${pick('en', now.verdict)}`, `${s} 首小时结束：区间 ${fmtPrice(ibNow.low)}–${fmtPrice(ibNow.high)}，${pick('zh', now.verdict)}`))
+  if (ibNow?.complete && ibBefore?.complete && ibNow.status !== ibBefore.status && (ibNow.status === 'above' || ibNow.status === 'below'))
+    out.push(L(`${s} broke ${ibNow.status === 'above' ? 'above' : 'below'} the first-hour range at ${fmtPrice(now.price)}`, `${s} ${ibNow.status === 'above' ? '向上突破' : '向下跌破'}首小时区间，现价 ${fmtPrice(now.price)}`))
+  if (before.vwap && now.vwap && Math.sign(before.vwap.vsPct) !== Math.sign(now.vwap.vsPct) && Math.abs(now.vwap.vsPct) >= 0.05)
+    out.push(L(`${s} crossed ${now.vwap.vsPct > 0 ? 'above' : 'below'} VWAP (${fmtPrice(now.vwap.value)})`, `${s} ${now.vwap.vsPct > 0 ? '上穿' : '下穿'} VWAP（${fmtPrice(now.vwap.value)}）`))
+  const flip = now.options?.gammaFlip
+  if (flip !== undefined && Math.sign(before.price - flip) !== Math.sign(now.price - flip))
+    out.push(L(`${s} crossed the gamma flip ${fmtPrice(flip)}: dealer hedging now ${now.price > flip ? 'damps' : 'amplifies'} moves`, `${s} 穿越伽马翻转点 ${fmtPrice(flip)}：做市商对冲现在会${now.price > flip ? '抑制' : '放大'}波动`))
+  for (const text of out) await $.ui.toast(text, { timeoutMs: 12_000 })
+}
+
+/** Loads and analyses one ticker's session; keeps the read and the bars for the tab. */
+async function refreshIntraday($: $, symbol: string, force = false): Promise<IntradayEntry | undefined> {
+  const have = await intradayOf($, symbol)
+  const cadence = intradayCadenceMs() ?? 30 * 60_000
+  if (!force && have && Date.now() - have.fetchedAt < cadence - 5_000) return have
+  const key = `#intraday:${symbol}`
+  if ((await read($, busy)).includes(key)) return have
+  await update($, busy, list => [...list, key])
+  try {
+    const f = fetcher($)
+    const [data, breadth, options, archive] = await Promise.all([loadIntraday(f, symbol), breadthNow($), optionsContext($, symbol), readArchive($)])
+    const daily = await reportOf($, symbol)
+    const readNow = analyzeIntraday(data, {
+      breadth,
+      options,
+      daily: daily ? { supports: daily.supports.map(x => x.price), resistances: daily.resistances.map(x => x.price) } : undefined,
+      archive: archive[symbol],
+    })
+    const entry: IntradayEntry = { symbol, fetchedAt: Date.now(), read: readNow, bars: data.bars }
+    await update($, intraday, all => ({ ...all, [symbol]: entry }))
+    await update($, intradayErrors, all => {
+      const { [symbol]: _gone, ...rest } = all
+
+      return rest
+    })
+    if (readNow.phase === 'after hours' || readNow.phase === 'closed') await archiveDay($, symbol, data)
+    await intradayAlerts($, have?.read, readNow)
+
+    return entry
+  } catch (error) {
+    await update($, intradayErrors, all => ({ ...all, [symbol]: errorText(error) }))
+    throw error
+  } finally {
+    await update($, busy, list => list.filter(s => s !== key))
+  }
+}
+
+/** Refreshes the shown ticker when the Intraday tab is open (and, with alerts on, the tickers whose reads are kept). */
+async function refreshShownIntraday($: $, force = false): Promise<void> {
+  const p = await read($, prefs)
+  const symbols = new Set<string>()
+  if (p.tab === 'intraday' && p.selected) symbols.add(p.selected)
+  if (p.intradayAlerts) for (const sym of Object.keys(await read($, intraday))) symbols.add(sym)
+  await Promise.all([...symbols].map(sym => refreshIntraday($, sym, force).catch(() => undefined)))
+}
+
 const toolText = (text: string, isError = false) => (isError ? { result: text, isError: true as const } : { result: text })
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
@@ -311,7 +483,7 @@ async function addSymbols($: $, text: string): Promise<string[]> {
 async function select($: $, symbol: string): Promise<void> {
   await setPrefs($, p => ({ ...p, selected: symbol }))
   await refreshTicker($, symbol)
-  await refreshShownReport($)
+  await Promise.all([refreshShownReport($), refreshShownIntraday($)])
 }
 
 /** In a group, takes the ticker out of that group only; in All, out of everything. */
@@ -401,7 +573,7 @@ async function openMain($: $): Promise<void> {
   await $.ui.open({ id: PANE, title: tr(await langNow($), 'Stocks', '股票'), columns: 100 })
   const p = await read($, prefs)
   await Promise.all([p.selected ? refreshTicker($, p.selected) : undefined, refreshCalendar($)])
-  await refreshShownReport($)
+  await Promise.all([refreshShownReport($), refreshShownIntraday($)])
 }
 
 async function openChart($: $): Promise<void> {
@@ -622,6 +794,13 @@ export const register: Register = on => {
       isDeferred: false,
     })
     await $.tool.register({
+      name: 'intraday_read',
+      description:
+        "Real-time read of today's session for one US stock or ETF (also '@SP.1' / '@ND.1' futures): the gap and pre-market range, the 5/15/30-minute opening ranges and the initial balance (first hour) with breakout status, VWAP and its bands, relative volume by time of day, the opening type (open-drive, test-drive, rejection-reverse, auction), breadth and leadership from sector ETFs and equal- vs cap-weight, VIX, the options levels that matter today (gamma flip, walls, straddle move), past sessions that looked like today at the same clock time and what they did next, and a lean for the rest of the day with scenarios and every intraday level. Real-time 1-minute data. Shows it in the stock-desk pane's Intraday tab. Use for 'how is today going', the open, the first hour, or intraday levels.",
+      inputSchema: { type: 'object', properties: { symbol: { type: 'string', description: 'US ticker, e.g. "SPY", "QQQ", "NVDA"' } }, required: ['symbol'] },
+      isDeferred: false,
+    })
+    await $.tool.register({
       name: 'probability',
       description:
         'Model probability that a ticker closes above / below, or touches, each given price level within N trading days: zero-drift lognormal on the implied vol of the expiry nearest the horizon (realized vol when there are no options).',
@@ -643,6 +822,10 @@ export const register: Register = on => {
       void read($, portfolio).then(pf => Promise.all(pf.positions.map(x => refreshTicker($, x.symbol))))
       void refreshCalendar($)
       void refreshShownReport($)
+    })
+    // The intraday tab follows the session: refreshIntraday skips until its cadence (1 min in the first hour) is due.
+    $.clock.every(60_000, () => {
+      if (intradayCadenceMs() !== undefined) void refreshShownIntraday($)
     })
 
     return next(e)
@@ -741,6 +924,24 @@ export const register: Register = on => {
       return toolText(reportMarkdown(report))
     } catch (error) {
       return toolText(`Could not analyse ${symbol}: ${errorText(error)}`, true)
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__intraday_read$/ }, async ($, e) => {
+    const symbol = String((e as unknown as { symbol?: string }).symbol ?? '').trim().toUpperCase().replace(/^\$/, '')
+    if (!/^@?[A-Z][A-Z0-9.\-]{0,9}$/.test(symbol)) return toolText('Give one US ticker as `symbol`, e.g. "SPY".', true)
+    try {
+      const entry = await refreshIntraday($, symbol, true)
+      if (!entry) return toolText(`${symbol} is already loading; try again in a few seconds.`, true)
+      if (!symbol.startsWith('@')) {
+        await addSymbols($, symbol)
+        await setPrefs($, p => ({ ...p, selected: symbol, tab: 'intraday' }))
+        await openMain($)
+      }
+
+      return toolText(intradayMarkdown(entry.read))
+    } catch (error) {
+      return toolText(`Intraday read of ${symbol} failed: ${errorText(error)}`, true)
     }
   })
 
@@ -980,12 +1181,13 @@ export const register: Register = on => {
         {(
           [
             ['analysis', L('Analysis', '分析')],
+            ['intraday', L('Intraday', '盘中')],
             ['overview', L('Chart & levels', 'K 线与关键价位')],
             ['news', newsAlerts ? L(`News · ${newsAlerts} alert${newsAlerts === 1 ? '' : 's'}`, `新闻 · ${newsAlerts} 条提醒`) : L('News', '新闻')],
             ['calendar', L('Calendar', '日历')],
           ] as [Tab, string][]
         ).map(([tab, label]) => (
-          <Button key={`tab-${tab}`} plain={p.tab === tab ? undefined : true} variant={p.tab === tab ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, tab })).then(() => refreshShownReport($))}>
+          <Button key={`tab-${tab}`} plain={p.tab === tab ? undefined : true} variant={p.tab === tab ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, tab })).then(() => Promise.all([refreshShownReport($), refreshShownIntraday($)]))}>
             {label}
           </Button>
         ))}
@@ -1199,6 +1401,185 @@ export const register: Register = on => {
           </Box>
         )
       }
+    } else if (p.tab === 'intraday') {
+      const entry = await intradayOf($, data.symbol)
+      const failed = (await read($, intradayErrors))[data.symbol]
+      const working = loading.includes(`#intraday:${data.symbol}`)
+      const scoreColor = (n: number) => (n >= 15 ? upColor(p) : n <= -15 ? downColor(p) : 'subtle')
+      const pct = (n: number, d = 2) => `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`
+      const cadence = intradayCadenceMs()
+      const controls = (
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          <Button key="intra-refresh" plain onPress={() => void refreshIntraday($, data.symbol, true).catch(() => undefined)}>
+            {working ? L('Loading…', '加载中…') : L('Refresh now', '立即刷新')}
+          </Button>
+          <Button key="intra-premarket" plain={p.showPremarket === false ? true : undefined} variant={p.showPremarket === false ? undefined : 'primary'} onPress={() => void setPrefs($, x => ({ ...x, showPremarket: x.showPremarket === false }))}>
+            {L('Pre-market', '盘前')}
+          </Button>
+          <Button key="intra-alerts" plain={p.intradayAlerts ? undefined : true} variant={p.intradayAlerts ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, intradayAlerts: !x.intradayAlerts }))}>
+            {p.intradayAlerts ? L('Alerts: on', '提醒：开') : L('Alerts: off', '提醒：关')}
+          </Button>
+          <Text dimColor size="footnote">
+            {cadence ? L(`auto-refresh every ${Math.round(cadence / 60_000)} min`, `每 ${Math.round(cadence / 60_000)} 分钟自动刷新`) : L('market closed: no auto-refresh', '休市：不自动刷新')}
+          </Text>
+        </Box>
+      )
+
+      if (!entry) {
+        body = (
+          <Box flexDirection="column" gap={1}>
+            {controls}
+            {failed && !working ? (
+              <Text color="warning">
+                {L('Intraday read failed: ', '盘中分析失败：')}
+                {failed}
+              </Text>
+            ) : (
+              <Text dimColor>{working ? L(`Loading ${data.symbol}'s session…`, `正在加载 ${data.symbol} 的盘中数据…`) : L('Press Refresh now to load today’s session.', '点击“立即刷新”加载今天的盘中数据。')}</Text>
+            )}
+          </Box>
+        )
+      } else {
+        const r = entry.read
+        const width = clamp(cols * 7.5, 320, 900)
+        const ranges = r.ranges
+          .map(x => `| ${x.minutes === 60 ? L('First hour (IB)', '首小时（IB）') : L(`${x.minutes} min`, `${x.minutes} 分钟`)} | ${fmtPrice(x.low)}–${fmtPrice(x.high)} | ${pick(lang, rangeStatusText(x.status))}${x.widthVsAtr !== undefined ? L(` · ${x.widthVsAtr.toFixed(2)}× ATR`, ` · ${x.widthVsAtr.toFixed(2)}× ATR`) : ''} |`)
+          .join('\n')
+        const timeline = r.timeline
+          .map(c => `| ${c.time} | ${fmtPrice(c.price)} | ${pct(c.vsOpenPct)} | ${c.vsVwapPct === undefined ? '—' : pct(c.vsVwapPct)} | ${c.score >= 0 ? '+' : ''}${c.score} ${pick(lang, biasText(c.bias))} | ${pick(lang, c.note).replace(/\|/g, '/')} |`)
+          .join('\n')
+        const levels = r.levels.map(l => `| ${fmtPrice(l.price)} | ${pct(((l.price - r.price) / r.price) * 100)} | ${pick(lang, l.label).replace(/\|/g, '/')} |`).join('\n')
+        const scen = r.scenarios
+          .map(sc => `| **${pick(lang, sc.label)}** | ${sc.target !== undefined ? fmtPrice(sc.target) : '—'} | ${pick(lang, sc.trigger).replace(/\|/g, '/')} | ${pick(lang, sc.invalidation).replace(/\|/g, '/')} |`)
+          .join('\n')
+        const b = r.breadth
+        const st = r.study
+
+        body = (
+          <Box flexDirection="column" gap={1}>
+            {controls}
+            <Box flexDirection="column">
+              <Text size="title" weight="bold" color={scoreColor(r.score)}>
+                {lang === 'zh' ? pick('zh', biasText(r.bias)) : r.bias.toUpperCase()} <Text tabular>{r.score >= 0 ? '+' : ''}{r.score}</Text>
+                <Text dimColor size="footnote" weight="regular">
+                  {'  '}
+                  {L('rest of the session · confidence', '本交易日剩余时段 · 置信度')} {r.confidence.toFixed(2)}
+                </Text>
+              </Text>
+              <Text>{pick(lang, r.verdict)}</Text>
+              <Text dimColor size="footnote">
+                {pick(lang, phaseText(r.phase))} · {r.sessionDate} {r.asOf.slice(11, 16)} {L('ET', '美东')} · {fmtPrice(r.price)} ({pct(r.changePct)}) · {L('gap', '跳空')} {pct(r.gap.pct)}
+                {r.gap.vsAtr !== undefined ? ` (${r.gap.vsAtr.toFixed(2)}× ATR)` : ''}
+                {r.gap.direction !== 'flat' ? (r.gap.filled ? L(' · gap filled', ' · 缺口已回补') : L(' · gap open', ' · 缺口未回补')) : ''} · {L('updated', '更新于')} {ago(entry.fetchedAt, lang)}
+              </Text>
+            </Box>
+            {Svg ? (
+              <Svg
+                source={intradayChart({ read: r, bars: entry.bars, width, colors: p.colors, lang, showPremarket: p.showPremarket !== false })}
+                alt={L(`${data.symbol} intraday chart with VWAP, opening range and first-hour range`, `${data.symbol} 盘中走势图，含 VWAP、开盘区间与首小时区间`)}
+              />
+            ) : (
+              <Text dimColor>{L('The intraday chart draws in the desktop app.', '盘中图表在桌面应用中显示。')}</Text>
+            )}
+            <Text dimColor size="footnote">
+              <Text color="#f59e0b">VWAP ±1σ</Text> · <Text color="#facc15">{L('opening range 30 min', '开盘区间 30 分钟')}</Text> · <Text color="#38bdf8">{L('first hour (initial balance)', '首小时（初始平衡区）')}</Text> · <Text color="#a855f7">{L('gamma flip', '伽马翻转点')}</Text> ·{' '}
+              <Text color="#22c55e">{L('call wall', '看涨墙')}</Text> · <Text color="#ef4444">{L('put wall', '看跌墙')}</Text> · {L('dashed grey: prior close', '灰色虚线：昨收')}
+            </Text>
+            <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
+              <Text>
+                <Text dimColor>{L('Open type ', '开盘类型 ')}</Text>
+                {pick(lang, openTypeText(r.openType))}
+              </Text>
+              {r.vwap && (
+                <Text>
+                  <Text dimColor>VWAP </Text>
+                  {fmtPrice(r.vwap.value)} ({pct(r.vwap.vsPct)}) <Text dimColor>{L(`· ${r.vwap.pctTimeAbove.toFixed(0)}% of minutes above`, `· ${r.vwap.pctTimeAbove.toFixed(0)}% 的分钟在其上方`)}</Text>
+                </Text>
+              )}
+              {r.rvol && (
+                <Text>
+                  <Text dimColor>{L('Rel. volume ', '相对成交量 ')}</Text>
+                  {r.rvol.value.toFixed(2)}×
+                </Text>
+              )}
+            </Box>
+            {b && (
+              <Text dimColor size="footnote">
+                {L(`Breadth: ${b.sectorsUp}/${b.sectors.length} sectors up, ${b.sectorsAboveOpen}/${b.sectors.length} above their open`, `广度：${b.sectors.length} 个板块中 ${b.sectorsUp} 个上涨、${b.sectorsAboveOpen} 个高于开盘价`)}
+                {b.rspMinusSpy !== undefined ? L(` · equal minus cap weight ${b.rspMinusSpy >= 0 ? '+' : ''}${b.rspMinusSpy.toFixed(2)} pp`, ` · 等权减市值加权 ${b.rspMinusSpy >= 0 ? '+' : ''}${b.rspMinusSpy.toFixed(2)} 个百分点`) : ''}
+                {b.qqqMinusSpy !== undefined ? ` · QQQ−SPY ${b.qqqMinusSpy >= 0 ? '+' : ''}${b.qqqMinusSpy.toFixed(2)}` : ''}
+                {b.iwmMinusSpy !== undefined ? ` · IWM−SPY ${b.iwmMinusSpy >= 0 ? '+' : ''}${b.iwmMinusSpy.toFixed(2)}` : ''}
+                {b.vix ? ` · VIX ${b.vix.last.toFixed(2)} (${pct(b.vix.changePct, 1)})` : ''}
+              </Text>
+            )}
+            {r.flags.length > 0 && (
+              <Box flexDirection="column">
+                <Text weight="semibold">{L('What stands out', '值得注意')}</Text>
+                {r.flags.slice(0, 8).map(f => (
+                  <Text>
+                    <Text color="warning">▲ </Text>
+                    {pick(lang, f)}
+                  </Text>
+                ))}
+              </Box>
+            )}
+            <Text weight="semibold">{L('Opening ranges', '开盘区间')}</Text>
+            <Markdown text={`| ${L('Range', '区间')} | ${L('Low–high', '低–高')} | ${L('Status', '状态')} |\n|---|---|---|\n${ranges}`} />
+            {r.timeline.length > 0 && (
+              <Box flexDirection="column">
+                <Text weight="semibold">
+                  {L('First-hour timeline', '首小时时间线')} <Text dimColor size="footnote">{L('· how the read formed', '· 判断是怎样形成的')}</Text>
+                </Text>
+                <Markdown text={`| ${L('Time', '时间')} | ${L('Price', '价格')} | ${L('vs open', '较开盘')} | ${L('vs VWAP', '较 VWAP')} | ${L('Read', '判断')} | ${L('Note', '说明')} |\n|---|---|---|---|---|---|\n${timeline}`} />
+              </Box>
+            )}
+            <Text weight="semibold">{L('Scenarios for the rest of the day', '今日剩余时段情景')}</Text>
+            <Markdown text={`| ${L('Case', '情景')} | ${L('Target', '目标')} | ${L('Trigger', '触发条件')} | ${L('Invalidation', '失效条件')} |\n|---|---|---|---|\n${scen}`} />
+            <Text weight="semibold">{L("Today's levels", '今日关键价位')}</Text>
+            <Markdown text={`| ${L('Price', '价格')} | ${L('vs now', '较现价')} | ${L('Level', '价位')} |\n|---|---|---|\n${levels}`} />
+            {st && (
+              <Box flexDirection="column">
+                <Text weight="semibold">
+                  {L('Sessions like today', '与今天相似的交易日')} <Text dimColor size="footnote">{L(`· at ${st.at} ET, n = ${st.n}`, `· 美东 ${st.at}，样本 ${st.n} 个`)}</Text>
+                </Text>
+                <Markdown
+                  text={
+                    `| ${L('Matched on', '匹配条件')} | ${L('Closed above now', '收盘高于现价')} | ${L('Rest-of-day mean', '剩余时段均值')} | ${L('Broke IB high / low', '突破首小时高 / 低')} | ${L('All sessions', '全部交易日')} |\n|---|---|---|---|---|\n` +
+                    `| ${pick(lang, st.matchedOn).replace(/\|/g, '/')} | ${st.closeAboveNow.toFixed(0)}% | ${pct(st.meanRestOfDay)} | ${st.extendedHigh.toFixed(0)}% / ${st.extendedLow.toFixed(0)}% | ${st.baseline.closeAboveNow.toFixed(0)}% · ${pct(st.baseline.meanRestOfDay)} (n ${st.baseline.n}) |`
+                  }
+                />
+                <Text dimColor size="footnote">{pick(lang, st.note)}</Text>
+              </Box>
+            )}
+            {r.notes.map(n => (
+              <Text dimColor size="footnote">
+                {pick(lang, n)}
+              </Text>
+            ))}
+            {r.errors.length > 0 && (
+              <Text color="warning" size="footnote">
+                {L('Data gaps: ', '数据缺失：')}
+                {r.errors.map(err => sourceError(err, lang)).join(L('; ', '；'))}
+              </Text>
+            )}
+            <Button
+              key="ask-intraday"
+              variant="primary"
+              onPress={() =>
+                void $.prompt.submit({
+                  text: L(
+                    `Use the stock-desk analyze skill and the intraday read to tell me how ${data.symbol}'s session is shaping up: the lean for the rest of the day, the levels that matter, what would change it, and the risks.`,
+                    `用 stock-desk analyze 技能和盘中分析，告诉我 ${data.symbol} 今天的走势：剩余时段的倾向、关键价位、什么会改变判断，以及风险。`,
+                  ),
+                  asUser: true,
+                })
+              }
+            >
+              {L('Ask Claude about today', '问 Claude 今天的走势')}
+            </Button>
+          </Box>
+        )
+      }
     } else if (p.tab === 'overview') {
       if (!a) {
         body = <Text dimColor>{L(`No price history for ${data.symbol}.`, `${data.symbol} 没有价格历史。`)}</Text>
@@ -1321,7 +1702,11 @@ export const register: Register = on => {
       )
     }
 
-    const isLoading = loading.includes(p.selected) || (p.tab === 'calendar' && loading.includes('#calendar')) || (p.tab === 'analysis' && loading.includes(`#report:${p.selected}`))
+    const isLoading =
+      loading.includes(p.selected) ||
+      (p.tab === 'calendar' && loading.includes('#calendar')) ||
+      (p.tab === 'analysis' && loading.includes(`#report:${p.selected}`)) ||
+      (p.tab === 'intraday' && loading.includes(`#intraday:${p.selected}`))
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -1331,7 +1716,7 @@ export const register: Register = on => {
         {tabs}
         {body}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true), refreshShownReport($, true)])}>
+          <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true), refreshShownReport($, true), refreshShownIntraday($, true)])}>
             {isLoading ? L('Refreshing…', '刷新中…') : L('Refresh', '刷新')}
           </Button>
           <Button

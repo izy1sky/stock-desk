@@ -1,5 +1,5 @@
 export type Range = '1M' | '3M' | '6M' | '1Y' | '2Y'
-export type Tab = 'analysis' | 'overview' | 'news' | 'calendar'
+export type Tab = 'analysis' | 'intraday' | 'overview' | 'news' | 'calendar'
 export type ColorMode = 'green-up' | 'red-up'
 export type AssetClass = 'stocks' | 'etf'
 export type CalCategory = 'watchlist' | 'big-earnings' | 'economy' | 'fed' | 'politics' | 'market' | 'mine'
@@ -30,6 +30,10 @@ export type Prefs = {
   showRules?: boolean
   /** Hover tooltips on the expanded chart's candles; off by default, as they hold the scroll wheel. */
   hoverCandles?: boolean
+  /** Intraday tab: draw the pre-market on the chart (default on). */
+  showPremarket?: boolean
+  /** Intraday alerts (first-hour summary, range and VWAP breaks) as toasts; off by default. */
+  intradayAlerts?: boolean
   /** The language the panes are written in (default English). */
   lang?: 'en' | 'zh'
   /** The analysis horizon, in trading days. */
@@ -153,6 +157,9 @@ export type MyEvent = {
  */
 export type StoredReport = { symbol: string; horizonDays: number; fetchedAt: number; [field: string]: unknown }
 
+/** The intraday read of a ticker with its minute bars, as kept in state (`IntradayRead` in hooks/engine/intraday.ts). */
+export type StoredIntraday = { symbol: string; fetchedAt: number; [field: string]: unknown }
+
 declare module 'claude-code' {
   interface PluginState {
     'stock-desk': {
@@ -165,6 +172,10 @@ declare module 'claude-code' {
       sizer: string
       /** The latest analysis report per ticker. */
       reports: Shaped<Record<string, StoredReport>>
+      /** The latest intraday read per ticker, with today's minute bars. */
+      intraday: Shaped<Record<string, StoredIntraday>>
+      /** Why the last intraday read of a ticker failed, until one succeeds. */
+      intradayErrors: Record<string, string>
       /** Why the last analysis of a ticker failed, until one succeeds. */
       reportErrors: Record<string, string>
       busy: string[]

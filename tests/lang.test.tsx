@@ -41,7 +41,38 @@ const HISTORY = history()
 const COMPANY = 'Tesla, Inc. Common Stock'
 const HEADLINE = 'Regulators open probe into Tesla driver assistance'
 
+const pad = (n: number) => String(n).padStart(2, '0')
+
+/** CNBC-shaped bars: 1-minute bars of one day (04:00–16:00), or 5-minute regular-session bars of the 30 weekdays up to a date. */
+function cnbcBars(url: string): Res {
+  const m = /\/bars\/[^/]+\/(1M|5M)\/(\d{8})\d{6}\/(\d{8})\d{6}\//.exec(url)
+  if (!m) return missing
+  const [, iv, from, to] = m
+  const iso = (d: string) => `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`
+  const rows: unknown[] = []
+  const push = (date: string, min: number, price: number, v: number) => {
+    const [y, mo, d] = date.split('-').map(Number)
+    const t = Date.UTC(y!, mo! - 1, d!, Math.floor(min / 60) + 5, min % 60)
+    rows.push({ open: price.toFixed(2), high: (price * 1.001).toFixed(2), low: (price * 0.999).toFixed(2), close: (price * 1.0002).toFixed(2), volume: v, tradeTime: `${date.replace(/-/g, '')}${pad(Math.floor(min / 60))}${pad(min % 60)}00`, tradeTimeinMills: t })
+  }
+  const weekday = (date: string) => ![0, 6].includes(new Date(`${date}T12:00:00Z`).getUTCDay())
+  if (iv === '1M') {
+    const date = iso(from!)
+    if (weekday(date)) for (let min = 240; min < 960; min++) push(date, min, 300 + Math.sin(min / 25) * 3 + (min > 570 ? (min - 570) * 0.01 : 0), min >= 570 ? 20_000 : 800)
+  } else {
+    const end = new Date(`${iso(to!)}T12:00:00Z`)
+    const dates: string[] = []
+    for (let d = new Date(end); dates.length < 30; d.setUTCDate(d.getUTCDate() - 1)) if (weekday(d.toISOString().slice(0, 10))) dates.unshift(d.toISOString().slice(0, 10))
+    dates.forEach((date, i) => {
+      for (let min = 570; min < 960; min += 5) push(date, min, 290 + i * 0.3 + Math.sin(min / 30), 100_000)
+    })
+  }
+
+  return json({ barData: { priceBars: rows } })
+}
+
 function respond(url: string): Res {
+  if (url.includes('ts-api.cnbc.com/harmony/app/bars/')) return cnbcBars(url)
   if (url.includes('/quote/TSLA/info'))
     return json({ data: { symbol: 'TSLA', companyName: COMPANY, marketStatus: 'Closed', primaryData: { lastSalePrice: '$300.00', netChange: '-4.00', percentageChange: '-1.3%', volume: '60,000,000', lastTradeTimestamp: 'Nov 18, 2026' } } })
   if (url.includes('/quote/') && url.includes('/info')) return json({ data: null })
@@ -96,6 +127,15 @@ test('the language switch turns every pane Chinese, and nothing the mod writes s
   expect(md).toContain('| 价格 | 较收盘 | 价位 |')
   expect(await untranslated(ui)).toEqual([])
 
+  // Intraday: the session read, its tables and the chart legend.
+  await ui.press({ key: 'tab-intraday' })
+  expect(await ui.find({ type: 'Button', key: 'tab-intraday', text: /^盘中$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /本交易日剩余时段/ })).toBeDefined()
+  const intraMd = (await ui.findAll({ type: 'Markdown' })).map(t => t.text ?? '').join('\n')
+  expect(intraMd).toContain('| 区间 | 低–高 | 状态 |')
+  expect(intraMd).toContain('| 价格 | 较现价 | 价位 |')
+  expect({ tab: 'tab-intraday', left: await untranslated(ui) }).toEqual({ tab: 'tab-intraday', left: [] })
+
   // Chart & levels, news and the calendar tab.
   for (const tab of ['tab-overview', 'tab-news', 'tab-calendar']) {
     await ui.press({ key: tab })
@@ -142,7 +182,16 @@ test('switching back to English restores it, and the tools keep answering in Eng
   expect(answer).toContain('# TSLA')
   expect(/[一-鿿]/.test(answer)).toBe(false)
 
+  // The intraday tool too: a plain string result, in English, while the pane is Chinese.
+  const intra = (await $.tool.call({ tool: 'mcp__stock-desk__intraday_read', symbol: 'TSLA' } as never)) as { result?: unknown; isError?: boolean }
+  expect(typeof intra.result).toBe('string')
+  expect(intra.isError).toBeUndefined()
+  expect(String(intra.result)).toContain('TSLA')
+  expect(/[一-鿿]/.test(String(intra.result))).toBe(false)
+
+  // intraday_read moved the pane to its Intraday tab; back to Analysis, in English.
   await ui.press({ key: 'lang' })
+  await ui.press({ key: 'tab-analysis' })
   expect(await ui.find({ type: 'Button', key: 'tab-analysis', text: /^Analysis$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^Trend$/ })).toBeDefined()
   await ui.unmount()
