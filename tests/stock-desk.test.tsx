@@ -87,6 +87,7 @@ test('adding a ticker loads its chart, drop check, news and calendar', async ($,
   await ui.input({ key: 'add', text: 'tsla' })
 
   expect((await ui.find({ type: 'Text', text: /^Tesla, Inc\./ }))?.text).toContain('TSLA')
+  await ui.press({ key: 'tab-overview' })
   expect(await ui.find({ type: 'Svg' })).toBeDefined()
   // The last session fell 12% on 3× volume: both are called out.
   expect(await ui.find({ type: 'Text', text: /normal day's range/ })).toBeDefined()

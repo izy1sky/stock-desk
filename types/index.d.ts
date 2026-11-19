@@ -1,5 +1,5 @@
 export type Range = '1M' | '3M' | '6M' | '1Y' | '2Y'
-export type Tab = 'overview' | 'news' | 'calendar'
+export type Tab = 'analysis' | 'overview' | 'news' | 'calendar'
 export type ColorMode = 'green-up' | 'red-up'
 export type AssetClass = 'stocks' | 'etf'
 export type CalCategory = 'watchlist' | 'big-earnings' | 'economy' | 'fed' | 'politics' | 'market' | 'mine'
@@ -30,6 +30,10 @@ export type Prefs = {
   showRules?: boolean
   /** Hover tooltips on the expanded chart's candles; off by default, as they hold the scroll wheel. */
   hoverCandles?: boolean
+  /** The analysis horizon, in trading days. */
+  horizon?: number
+  /** Set once the Analysis tab has been opened for the person on first load. */
+  seenAnalysis?: boolean
 }
 
 /** One holding, as the person entered it. */
@@ -141,6 +145,12 @@ export type MyEvent = {
   addedBy: 'you' | 'claude'
 }
 
+/**
+ * An analysis report as kept in state: the full type is `Report` in
+ * hooks/engine/report.ts (the contract must not import it).
+ */
+export type StoredReport = { symbol: string; horizonDays: number; fetchedAt: number; [field: string]: unknown }
+
 declare module 'claude-code' {
   interface PluginState {
     'stock-desk': {
@@ -151,6 +161,10 @@ declare module 'claude-code' {
       portfolio: Shaped<Portfolio>
       /** The position-size calculator's last answer. */
       sizer: string
+      /** The latest analysis report per ticker. */
+      reports: Shaped<Record<string, StoredReport>>
+      /** Why the last analysis of a ticker failed, until one succeeds. */
+      reportErrors: Record<string, string>
       busy: string[]
     }
   }

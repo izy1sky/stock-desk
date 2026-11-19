@@ -1,6 +1,6 @@
 {
   "name": "stock-desk",
-  "description": "A stock pane for Claude Code: candlestick charts, news, market calendar and portfolio checks",
+  "description": "A stock analysis engine for Claude Code: trend, volume, options and futures signals with scenarios and odds, plus charts, news, calendar and portfolio checks",
   "owner": {
     "name": "izy1sky"
   },

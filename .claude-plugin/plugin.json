@@ -1,7 +1,7 @@
 {
   "name": "stock-desk",
-  "version": "0.1.0",
-  "description": "A stock pane: daily candlestick chart with highs, lows and trend, price-drop checks, news, and earnings and economic calendars",
+  "version": "0.2.0",
+  "description": "Stock analysis engine and pane: trend, volatility, volume flow, options positioning (gamma, skew, walls), index futures and COT, scored into a bias with scenarios, model odds and historical analogs",
   "author": {
     "name": "izy1sky"
   },

@@ -202,6 +202,18 @@ export async function loadTicker(fetch: Fetch, symbol: string, known?: AssetClas
   }
 }
 
+/**
+ * Up to `years` of daily candles, oldest first, for the analysis engine (the
+ * historical-analog study wants a long record; the pane's chart keeps two years).
+ */
+export async function loadHistory(fetch: Fetch, symbol: string, assetClass: AssetClass, years = 10): Promise<Bar[]> {
+  const today = marketToday()
+  const limit = Math.ceil(years * 260)
+  const json = await getJson(fetch, `${API}/quote/${symbol.toUpperCase()}/historical?assetclass=${assetClass}&fromdate=${addDays(today, -Math.round(years * 365.25))}&todate=${today}&limit=${limit}`)
+
+  return parseBars(json?.data)
+}
+
 export function parseEarnings(date: string, data: any): EarningsRow[] {
   const rows: any[] = data?.rows ?? []
 

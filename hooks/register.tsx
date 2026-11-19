@@ -10,6 +10,9 @@ import { buildEvents, CATEGORY, parseMyEvent } from './events'
 import type { CalEvent } from './events'
 import { levelRows, sessionsMarkdown, statRows } from './levels'
 import type { Row } from './levels'
+import { betaMarkdown, buildBetaMap, buildMarket, buildOptions, buildProbabilities, buildReport, loadMarketContext, marketMarkdown, moduleLabel, optionsReportMarkdown, probabilitiesMarkdown, reportMarkdown, scoreBar } from './engine/report'
+import type { MarketContext, Report } from './engine/report'
+import { fmtPrice } from './engine/technicals'
 import { chartPage } from './page'
 import { applyCommand, EMPTY_PORTFOLIO, parseCommand, RULE_LABELS, runChecks, sizePosition, valuePortfolio } from './portfolio'
 
@@ -18,6 +21,14 @@ const CHART = 'stock-desk-chart'
 const CAL = 'stock-desk-calendar'
 const PORT = 'stock-desk-portfolio'
 const TICKER_TTL = 5 * 60_000
+const REPORT_TTL = 10 * 60_000
+const MARKET_TTL = 2 * 60_000
+const HORIZONS_DAYS: [number, string][] = [
+  [5, '1 week'],
+  [10, '2 weeks'],
+  [21, '1 month'],
+  [63, '3 months'],
+]
 const CALENDAR_TTL = 6 * 3600_000
 const ALL_CATEGORIES: CalCategory[] = ['watchlist', 'big-earnings', 'economy', 'fed', 'politics', 'market', 'mine']
 const DEFAULT_PREFS: Prefs = {
@@ -27,8 +38,9 @@ const DEFAULT_PREFS: Prefs = {
   selected: 'AAPL',
   range: '3M',
   bigRange: '6M',
-  tab: 'overview',
+  tab: 'analysis',
   colors: 'green-up',
+  horizon: 10,
   calHorizon: 30,
   calCategories: ALL_CATEGORIES,
 }
@@ -43,6 +55,8 @@ const myEvents = atom({ plugin: 'stock-desk', key: 'myEvents' } as const, [], { 
 const portfolio = atom({ plugin: 'stock-desk', key: 'portfolio' } as const, EMPTY_PORTFOLIO, { shape: 'portfolio-1' })
 const sizer = atom({ plugin: 'stock-desk', key: 'sizer' } as const, '')
 const busy = atom({ plugin: 'stock-desk', key: 'busy' } as const, [])
+const reports = atom({ plugin: 'stock-desk', key: 'reports' } as const, {}, { shape: 'reports-1' })
+const reportErrors = atom({ plugin: 'stock-desk', key: 'reportErrors' } as const, {})
 
 type $ = EngineInterface
 
@@ -152,6 +166,75 @@ async function refreshCalendar($: $, force = false): Promise<void> {
   }
 }
 
+// The market context (futures, cash, COT, VIX family) is the same for every
+// ticker: one load serves every report for a couple of minutes.
+let marketCache: MarketContext | undefined
+
+async function marketContext($: $): Promise<MarketContext> {
+  if (marketCache && Date.now() - marketCache.fetchedAt < MARKET_TTL) return marketCache
+  marketCache = await loadMarketContext(fetcher($))
+
+  return marketCache
+}
+
+/** Weekdays from today to `iso`: trading days to an event, holidays aside. */
+function tradingDaysTo(today: string, iso: string): number {
+  let n = 0
+  for (let d = new Date(`${today}T12:00:00Z`); d.toISOString().slice(0, 10) < iso; d.setUTCDate(d.getUTCDate() + 1)) {
+    const day = d.getUTCDay()
+    if (day !== 0 && day !== 6) n++
+  }
+
+  return n
+}
+
+const horizonOf = (p: Prefs) => p.horizon ?? 10
+
+/** The stored report of a ticker (state keeps it as `StoredReport`; it is always a `Report`). */
+const reportOf = async ($: $, symbol: string) => (await read($, reports))[symbol] as Report | undefined
+
+/** Builds (or reuses, when fresh and for the same horizon) the analysis report of one ticker. */
+async function refreshReport($: $, symbol: string, horizon: number, force = false): Promise<Report | undefined> {
+  const have = await reportOf($, symbol)
+  if (!force && have && have.horizonDays === horizon && Date.now() - have.fetchedAt < REPORT_TTL) return have
+  const key = `#report:${symbol}`
+  if ((await read($, busy)).includes(key)) return have
+  await update($, busy, list => [...list, key])
+  try {
+    const earnings = nextEarnings(await read($, calendar), symbol)
+    const known = (await read($, tickers))[symbol]?.assetClass
+    const report = await buildReport(fetcher($), symbol, {
+      horizonDays: horizon,
+      assetClass: known,
+      market: await marketContext($),
+      earningsInDays: earnings ? tradingDaysTo(marketToday(), earnings.date) : undefined,
+    })
+    await update($, reports, all => ({ ...all, [symbol]: report }))
+    await update($, reportErrors, all => {
+      const { [symbol]: _gone, ...rest } = all
+
+      return rest
+    })
+
+    return report
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error)
+    await update($, reportErrors, all => ({ ...all, [symbol]: text }))
+    throw error
+  } finally {
+    await update($, busy, list => list.filter(s => s !== key))
+  }
+}
+
+/** Refreshes the selected ticker's report when the Analysis tab shows it. */
+async function refreshShownReport($: $, force = false): Promise<void> {
+  const p = await read($, prefs)
+  if (p.tab === 'analysis' && p.selected) await refreshReport($, p.selected, horizonOf(p), force).catch(() => undefined)
+}
+
+const toolText = (text: string, isError = false) => ({ result: { content: [{ type: 'text' as const, text }], isError } })
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
 function parseSymbols(text: string): string[] {
   return text
     .toUpperCase()
@@ -183,6 +266,7 @@ async function addSymbols($: $, text: string): Promise<string[]> {
 async function select($: $, symbol: string): Promise<void> {
   await setPrefs($, p => ({ ...p, selected: symbol }))
   await refreshTicker($, symbol)
+  await refreshShownReport($)
 }
 
 /** In a group, takes the ticker out of that group only; in All, out of everything. */
@@ -272,6 +356,7 @@ async function openMain($: $): Promise<void> {
   await $.ui.open({ id: PANE, title: 'Stocks', columns: 100 })
   const p = await read($, prefs)
   await Promise.all([p.selected ? refreshTicker($, p.selected) : undefined, refreshCalendar($)])
+  await refreshShownReport($)
 }
 
 async function openChart($: $): Promise<void> {
@@ -396,6 +481,8 @@ export const register: Register = on => {
       const groups = Array.isArray(saved.groups) ? saved.groups : []
       await update($, prefs, () => ({ ...DEFAULT_PREFS, ...saved, groups, group: groups.some(g => g.name === saved.group) ? saved.group! : '' }))
     }
+    // The pane leads with the analysis now: show it once to people who used the old Overview.
+    if (!(await read($, prefs)).seenAnalysis) await setPrefs($, p => ({ ...p, tab: 'analysis', seenAnalysis: true }))
     const mine = (await $.store.get('myEvents')) as MyEvent[] | undefined
     if (Array.isArray(mine)) await update($, myEvents, () => mine)
     const savedPortfolio = (await $.store.get('portfolio')) as Partial<Portfolio> | undefined
@@ -441,12 +528,73 @@ export const register: Register = on => {
       inputSchema: { type: 'object', properties: { symbols: { type: 'string', description: 'Space-separated US tickers, e.g. "TSLA AMD"' } }, required: ['symbols'] },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'analyze_ticker',
+      description:
+        'Full data analysis of one US stock, ETF or index (SPX, NDX, RUT also work): trend (MA 5/10/20/50/200 stack, slopes, ADX, swing structure, weekly), volatility (realized vs implied, percentile, squeeze), volume and flow (OBV, up/down volume, distribution days), options positioning (put/call, ATM term structure, 25-delta skew, dealer gamma and the gamma flip, call/put walls, max pain, straddle-implied moves, unusual volume), index futures and COT, combined into a composite bias for the horizon, plus key levels, expected moves, bull/base/bear scenarios with model odds and a 10-year historical-analog study. Also shows the result in the stock-desk pane. Load the stock-desk analyze skill before interpreting it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string', description: 'US ticker, e.g. "NVDA", "SPY", "SOXL", "SPX"' },
+          horizon_days: { type: 'integer', minimum: 1, maximum: 120, description: 'Horizon in trading days (default 10): 1-5 leans on futures/options/volume, 6-30 on trend, longer on trend more' },
+        },
+        required: ['symbol'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'market_overview',
+      description:
+        'The US market read: ES/NQ/YM/RTY futures with the cash index level they imply (pre-market too), the VIX / VIX9D / VIX3M / VVIX / SKEW term structure, CFTC COT positioning of leveraged funds, asset managers and dealers in ES and NQ, and a full SPY analysis. Use for questions about the market as a whole, the pre-market, or as context before analysing a single stock.',
+      inputSchema: { type: 'object', properties: { horizon_days: { type: 'integer', minimum: 1, maximum: 120, description: 'Horizon for the SPY analysis (default 5)' } } },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'options_positioning',
+      description:
+        "One ticker's options market in detail, from CBOE's delayed chain with greeks: put/call by volume and open interest, ATM implied-vol term structure, 25-delta skew, dealer gamma exposure with the gamma flip, call and put walls, max pain per expiry, straddle-implied moves, largest open interest and unusual volume.",
+      inputSchema: { type: 'object', properties: { symbol: { type: 'string', description: 'US ticker or index, e.g. "SPY", "SPX", "NVDA"' } }, required: ['symbol'] },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'beta_map',
+      description:
+        'Where other tickers would be if a base moved to a level or by a percent, e.g. "SPX to 7500: SOXL and TQQQ?" — regression beta of daily returns with correlation and a ±1 residual-sigma band per target. An index base (SPX, NDX, DJI, RUT) is measured from its cash close.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          base: { type: 'string', description: 'The base: "SPX" (default), "NDX", "SPY", "QQQ", a stock…' },
+          targets: { type: 'string', description: 'Space-separated tickers, e.g. "SOXL TQQQ NVDA"' },
+          base_target: { type: 'number', description: 'The base price to map, e.g. 7500' },
+          base_move_pct: { type: 'number', description: 'Or the base move in percent, e.g. 2.4 (used when base_target is not given)' },
+          lookback: { type: 'integer', minimum: 20, maximum: 250, description: 'Trading days of returns for the regression (default 60)' },
+        },
+        required: ['targets'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'probability',
+      description:
+        'Model probability that a ticker closes above / below, or touches, each given price level within N trading days: zero-drift lognormal on the implied vol of the expiry nearest the horizon (realized vol when there are no options).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string', description: 'US ticker or index' },
+          levels: { type: 'array', items: { type: 'number' }, description: 'Price levels, e.g. [7400, 7500]' },
+          days: { type: 'integer', minimum: 1, maximum: 252, description: 'Trading days ahead' },
+        },
+        required: ['symbol', 'levels', 'days'],
+      },
+      isDeferred: false,
+    })
 
     $.clock.after(50, () => void openMain($))
     $.clock.every(TICKER_TTL, () => {
       void read($, prefs).then(p => (p.selected ? refreshTicker($, p.selected, true) : undefined))
       void read($, portfolio).then(pf => Promise.all(pf.positions.map(x => refreshTicker($, x.symbol))))
       void refreshCalendar($)
+      void refreshShownReport($)
     })
 
     return next(e)
@@ -527,6 +675,74 @@ export const register: Register = on => {
     await openMain($)
 
     return { result: { content: [{ type: 'text', text: added.length ? `Showing ${added.join(', ')} in the stock pane.` : 'No valid tickers given.' }], isError: !added.length } }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__analyze_ticker$/ }, async ($, e) => {
+    const args = e as unknown as { symbol?: string; horizon_days?: number }
+    const symbol = parseSymbols(String(args.symbol ?? ''))[0]
+    if (!symbol) return toolText('Give one US ticker as `symbol`.', true)
+    const horizon = Math.max(1, Math.min(120, Math.round(Number(args.horizon_days ?? 10)) || 10))
+    try {
+      await refreshCalendar($)
+      const report = await refreshReport($, symbol, horizon)
+      if (!report) return toolText(`${symbol} is already being analysed; try again in a few seconds.`, true)
+      await addSymbols($, symbol)
+      await setPrefs($, p => ({ ...p, selected: symbol, tab: 'analysis', horizon }))
+      await openMain($)
+
+      return toolText(reportMarkdown(report))
+    } catch (error) {
+      return toolText(`Could not analyse ${symbol}: ${errorText(error)}`, true)
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__market_overview$/ }, async ($, e) => {
+    const horizon = Math.max(1, Math.min(120, Math.round(Number((e as unknown as { horizon_days?: number }).horizon_days ?? 5)) || 5))
+    try {
+      const market = await buildMarket(fetcher($), horizon)
+      marketCache = market.context
+      if (market.spy) await update($, reports, all => ({ ...all, SPY: market.spy! }))
+
+      return toolText(marketMarkdown(market))
+    } catch (error) {
+      return toolText(`Market overview failed: ${errorText(error)}`, true)
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__options_positioning$/ }, async ($, e) => {
+    const symbol = parseSymbols(String((e as unknown as { symbol?: string }).symbol ?? ''))[0]
+    if (!symbol) return toolText('Give one US ticker as `symbol`.', true)
+    try {
+      return toolText(optionsReportMarkdown(symbol, await buildOptions(fetcher($), symbol, marketCache?.vol)))
+    } catch (error) {
+      return toolText(`No options data for ${symbol}: ${errorText(error)}`, true)
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__beta_map$/ }, async ($, e) => {
+    const args = e as unknown as { base?: string; targets?: string | string[]; base_target?: number; base_move_pct?: number; lookback?: number }
+    const targets = parseSymbols(Array.isArray(args.targets) ? args.targets.join(' ') : String(args.targets ?? ''))
+    const base = parseSymbols(String(args.base ?? 'SPX'))[0] ?? 'SPX'
+    if (!targets.length) return toolText('Give the tickers to map as `targets`, e.g. "SOXL TQQQ".', true)
+    if (args.base_target === undefined && args.base_move_pct === undefined) return toolText('Give `base_target` (a price) or `base_move_pct` (a percent).', true)
+    try {
+      return toolText(betaMarkdown(await buildBetaMap(fetcher($), { base, targets, baseTarget: args.base_target, baseMovePct: args.base_move_pct, lookback: args.lookback })))
+    } catch (error) {
+      return toolText(`Beta map failed: ${errorText(error)}`, true)
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__stock-desk__probability$/ }, async ($, e) => {
+    const args = e as unknown as { symbol?: string; levels?: unknown; days?: number }
+    const symbol = parseSymbols(String(args.symbol ?? ''))[0]
+    const raw = Array.isArray(args.levels) ? args.levels : String(args.levels ?? '').split(/[\s,;]+/)
+    const levels = raw.map(Number).filter(n => Number.isFinite(n) && n > 0)
+    if (!symbol || !levels.length || !args.days) return toolText('Give `symbol`, `levels` (prices) and `days` (trading days).', true)
+    try {
+      return toolText(probabilitiesMarkdown(await buildProbabilities(fetcher($), { symbol, levels, days: Number(args.days) })))
+    } catch (error) {
+      return toolText(`Probability failed: ${errorText(error)}`, true)
+    }
   })
 
   // ---------- the main pane ----------
@@ -704,12 +920,13 @@ export const register: Register = on => {
       <Box flexDirection="row" gap={1}>
         {(
           [
-            ['overview', 'Overview'],
+            ['analysis', 'Analysis'],
+            ['overview', 'Chart & levels'],
             ['news', newsAlerts ? `News · ${newsAlerts} alert${newsAlerts === 1 ? '' : 's'}` : 'News'],
             ['calendar', 'Calendar'],
           ] as [Tab, string][]
         ).map(([tab, label]) => (
-          <Button key={`tab-${tab}`} plain={p.tab === tab ? undefined : true} variant={p.tab === tab ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, tab }))}>
+          <Button key={`tab-${tab}`} plain={p.tab === tab ? undefined : true} variant={p.tab === tab ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, tab })).then(() => refreshShownReport($))}>
             {label}
           </Button>
         ))}
@@ -717,7 +934,184 @@ export const register: Register = on => {
     )
 
     let body
-    if (p.tab === 'overview') {
+    if (p.tab === 'analysis') {
+      const report = await reportOf($, data.symbol)
+      const failed = (await read($, reportErrors))[data.symbol]
+      const working = loading.includes(`#report:${data.symbol}`)
+      const horizon = horizonOf(p)
+      const scoreColor = (n: number) => (n >= 15 ? upColor(p) : n <= -15 ? downColor(p) : 'subtle')
+      const pct = (n: number, d = 1) => `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`
+
+      const horizonRow = (
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          <Text dimColor>Horizon:</Text>
+          {HORIZONS_DAYS.map(([days, label]) => (
+            <Button key={`hz-${days}`} plain={horizon === days ? undefined : true} variant={horizon === days ? 'primary' : undefined} onPress={() => void setPrefs($, x => ({ ...x, horizon: days })).then(() => refreshShownReport($))}>
+              {label}
+            </Button>
+          ))}
+          <Button key="report-refresh" plain onPress={() => void refreshShownReport($, true)}>
+            {working ? 'Analysing…' : 'Re-run analysis'}
+          </Button>
+        </Box>
+      )
+
+      if (!report) {
+        body = (
+          <Box flexDirection="column" gap={1}>
+            {horizonRow}
+            {failed && !working ? (
+              <Text color="warning">Analysis failed: {failed}</Text>
+            ) : (
+              <Text dimColor>
+                {working ? `Analysing ${data.symbol}: ten years of prices, the option chain, futures and positioning…` : 'Press Re-run analysis to analyse this ticker.'}
+              </Text>
+            )}
+          </Box>
+        )
+      } else {
+        const c = report.composite
+        const o = report.options
+        const levelRowsMd = [
+          ...report.resistances.map(l => ({ price: l.price, what: `Resistance · ${l.kind}${l.date ? ` ${l.date}` : ''}` })),
+          ...report.supports.map(l => ({ price: l.price, what: `Support · ${l.kind}${l.date ? ` ${l.date}` : ''}` })),
+          ...(o?.levels.callWall !== undefined ? [{ price: o.levels.callWall, what: 'Options · call wall (largest call gamma)' }] : []),
+          ...(o?.levels.putWall !== undefined ? [{ price: o.levels.putWall, what: 'Options · put wall (largest put gamma)' }] : []),
+          ...(o?.levels.gammaFlip !== undefined ? [{ price: o.levels.gammaFlip, what: 'Options · gamma flip (dealers short gamma below)' }] : []),
+          ...(o?.maxPainMonthly ? [{ price: o.maxPainMonthly.strike, what: `Options · max pain ${o.maxPainMonthly.expiry}` }] : []),
+        ].sort((a, b) => b.price - a.price)
+        const flags = report.modules.flatMap(m => m.flags.slice(0, 2).map(f => ({ key: m.key, f }))).slice(0, 8)
+        const scen = report.scenarios.rows
+          .map(sc => {
+            const where = sc.target !== undefined ? fmtPrice(sc.target) : sc.range ? `${fmtPrice(sc.range[0])}–${fmtPrice(sc.range[1])}` : '—'
+
+            return `| **${sc.name}** | ${where} | ${(sc.probability * 100).toFixed(0)}% ${sc.probKind} | ${sc.trigger.replace(/\|/g, '/')} | ${sc.invalidation.replace(/\|/g, '/')} |`
+          })
+          .join('\n')
+        const moves = report.moves.map(m => `| ${m.label} | ±${m.pct1.toFixed(2)}% | ${fmtPrice(m.lower1)}–${fmtPrice(m.upper1)} | ${fmtPrice(m.lower2)}–${fmtPrice(m.upper2)} |`).join('\n')
+        const a = report.analogs
+
+        body = (
+          <Box flexDirection="column" gap={1}>
+            {horizonRow}
+            <Box flexDirection="column">
+              <Text size="title" weight="bold" color={scoreColor(c.score)}>
+                {c.bias.toUpperCase()} <Text tabular>{c.score >= 0 ? '+' : ''}{c.score}</Text>
+              </Text>
+              <Text>
+                Confidence {c.confidence.toFixed(2)} · {c.agree}/{c.total} modules agree · next {report.horizonDays} sessions
+              </Text>
+              <Text dimColor size="footnote">
+                From the {report.asOf} close {fmtPrice(report.spot)}
+                {report.indicated ? ` · latest print ${fmtPrice(report.indicated.price)} (${pct(report.indicated.changePct, 2)})` : ''} · σ {(report.sigma * 100).toFixed(1)}% {report.sigmaSource} · analysed {ago(report.fetchedAt)}
+              </Text>
+            </Box>
+            <Text weight="semibold">
+              Modules <Text dimColor size="footnote">· hover a name for its readings</Text>
+            </Text>
+            <Box flexDirection="column">
+              {report.modules.map(m => {
+                const scope = `mod-${m.key}`
+
+                return (
+                  <Box key={scope} flexDirection="column">
+                    <Box flexDirection="row">
+                      <Box width={16}>
+                        <Text underline hover={{ scope, color: 'claude' }}>
+                          {moduleLabel(m.key)}
+                        </Text>
+                      </Box>
+                      <Box width={14}>
+                        <Text color={scoreColor(m.score)}>{scoreBar(m.score)}</Text>
+                      </Box>
+                      <Box width={7}>
+                        <Text tabular color={scoreColor(m.score)}>
+                          {m.score >= 0 ? '+' : ''}
+                          {m.score}
+                        </Text>
+                      </Box>
+                      <Text dimColor tabular>
+                        conf {m.confidence.toFixed(2)} · weight {(c.weights[m.key] ?? 0).toFixed(2)}
+                      </Text>
+                      <Box position="absolute" top={1} left={2} display="none" hover={{ scope, display: 'flex' }} flexDirection="column" width={Math.min(76, cols - 4)} paddingX={1} backgroundColor="#1f2328" borderStyle="round" borderColor="#3b4048">
+                        {m.readings.map(r => (
+                          <Text color="#f3f4f6">
+                            {r.name}: {typeof r.value === 'number' ? +r.value.toFixed(4) : r.value}
+                            {r.note ? <Text color="#9ca3af"> ({r.note})</Text> : ''}
+                          </Text>
+                        ))}
+                      </Box>
+                    </Box>
+                    <Box paddingLeft={2}>
+                      <Text dimColor>{m.verdict}</Text>
+                    </Box>
+                  </Box>
+                )
+              })}
+            </Box>
+            {flags.length > 0 && (
+              <Box flexDirection="column">
+                <Text weight="semibold">What stands out</Text>
+                {flags.map(({ key, f }) => (
+                  <Text>
+                    <Text color="warning">▲ </Text>
+                    <Text dimColor>{moduleLabel(key)}:</Text> {f}
+                  </Text>
+                ))}
+              </Box>
+            )}
+            {report.notes.map(n => (
+              <Text color="warning">⚠ {n}</Text>
+            ))}
+            <Text weight="semibold">Key levels</Text>
+            <Markdown text={`| Price | vs close | Level |\n|---|---|---|\n${levelRowsMd.map(l => `| ${fmtPrice(l.price)} | ${pct(((l.price - report.spot) / report.spot) * 100)} | ${l.what} |`).join('\n')}`} />
+            {o && (
+              <Text dimColor size="footnote">
+                Options: P/C volume {o.pcVolume?.toFixed(2) ?? '—'}, OI {o.pcOi?.toFixed(2) ?? '—'} · ATM IV 30d {o.ivAtm30 !== undefined ? `${(o.ivAtm30 * 100).toFixed(1)}%` : '—'} · 25Δ skew {o.skew ? `${(o.skew.skew * 100).toFixed(1)} pts (${o.skew.read})` : '—'} · straddle to {o.moves[0]?.expiry ?? '—'} ±{o.moves[0]?.pct.toFixed(2) ?? '—'}%
+              </Text>
+            )}
+            <Text weight="semibold">
+              Scenarios <Text dimColor size="footnote">· model odds from σ, not a direction call</Text>
+            </Text>
+            <Markdown text={`| Case | Target | Odds | Trigger | Invalidation |\n|---|---|---|---|---|\n${scen}`} />
+            <Text weight="semibold">Expected moves</Text>
+            <Markdown text={`| Horizon | 1σ | 1σ range | 2σ range |\n|---|---|---|---|\n${moves}`} />
+            <Text weight="semibold">Historical analogs</Text>
+            {a.ok ? (
+              <Box flexDirection="column">
+                <Markdown
+                  text={`| Horizon | Analog win | Mean | p10 / p90 | All days win | All days mean |\n|---|---|---|---|---|---|\n${a.horizons
+                    .map(h => `| ${h.days} days | ${h.analogs.winRate.toFixed(0)}% | ${pct(h.analogs.mean, 2)} | ${pct(h.analogs.p10)} / ${pct(h.analogs.p90)} | ${h.baseline.winRate.toFixed(0)}% | ${pct(h.baseline.mean, 2)} |`)
+                    .join('\n')}`}
+                />
+                <Text dimColor size="footnote">
+                  The {a.k} past days most like today (trend, momentum, volatility, volume), from {a.eligibleDays} days; closest {a.closest.slice(0, 3).map(x => x.date).join(', ')}. Overlapping, small samples: context, not a forecast.
+                </Text>
+              </Box>
+            ) : (
+              <Text dimColor>{a.note}</Text>
+            )}
+            {report.errors.length > 0 && (
+              <Text color="warning" size="footnote">
+                Data gaps: {report.errors.join('; ')}
+              </Text>
+            )}
+            <Button
+              key="ask-read"
+              variant="primary"
+              onPress={() =>
+                void $.prompt.submit({
+                  text: `Use the stock-desk analyze skill to give me a full data-driven read on ${data.symbol} for the next ${report.horizonDays} trading days: bias and confidence, the readings behind it, key levels, scenarios, what would change the view, and the risks.`,
+                  asUser: true,
+                })
+              }
+            >
+              Ask Claude for a written read
+            </Button>
+          </Box>
+        )
+      }
+    } else if (p.tab === 'overview') {
       if (!a) {
         body = <Text dimColor>No price history for {data.symbol}.</Text>
       } else {
@@ -823,7 +1217,7 @@ export const register: Register = on => {
       )
     }
 
-    const isLoading = loading.includes(p.selected) || (p.tab === 'calendar' && loading.includes('#calendar'))
+    const isLoading = loading.includes(p.selected) || (p.tab === 'calendar' && loading.includes('#calendar')) || (p.tab === 'analysis' && loading.includes(`#report:${p.selected}`))
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -833,14 +1227,14 @@ export const register: Register = on => {
         {tabs}
         {body}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true)])}>
+          <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true), refreshShownReport($, true)])}>
             {isLoading ? 'Refreshing…' : 'Refresh'}
           </Button>
           <Button
             key="ask"
             onPress={() =>
               void $.prompt.submit({
-                text: `Give me a full read on ${data.symbol}: use the us-stock-analysis skill for fundamentals and technicals, and check the latest news and upcoming catalysts. Point out anything that explains recent price drops.`,
+                text: `Use the stock-desk analyze skill for a full read on ${data.symbol} over the next ${horizonOf(p)} trading days, and check the latest news and upcoming catalysts.`,
                 asUser: true,
               })
             }
@@ -858,7 +1252,7 @@ export const register: Register = on => {
           </Button>
         </Box>
         <Text dimColor size="footnote">
-          Updated {ago(data.fetchedAt)} · data: Nasdaq · auto-refresh every 5 min. Signals come from price history only; this is not investment advice.
+          Updated {ago(data.fetchedAt)} · data: Nasdaq, CBOE (options, VIX), CNBC (futures), CFTC (COT) · auto-refresh every 5 min. Analysis of market data, not investment advice.
         </Text>
       </Box>
     )
