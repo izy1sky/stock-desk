@@ -232,7 +232,8 @@ async function refreshShownReport($: $, force = false): Promise<void> {
   if (p.tab === 'analysis' && p.selected) await refreshReport($, p.selected, horizonOf(p), force).catch(() => undefined)
 }
 
-const toolText = (text: string, isError = false) => ({ result: { content: [{ type: 'text' as const, text }], isError } })
+// A registered tool answers with its text as `result`; `isError` sits beside it.
+const toolText = (text: string, isError = false) => (isError ? { result: text, isError: true as const } : { result: text })
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 function parseSymbols(text: string): string[] {
@@ -631,7 +632,7 @@ export const register: Register = on => {
       1,
     )
 
-    return { result: { content: [{ type: 'text', text }], isError: false } }
+    return toolText(text)
   })
 
   on('command.run', { command: 'stock-calendar' }, async $ => {
@@ -657,7 +658,7 @@ export const register: Register = on => {
     await setMyEvents($, list => [...list.filter(m => !(m.date === event.date && m.title === event.title)), event])
     await openCalendar($)
 
-    return { result: { content: [{ type: 'text', text: `Added to the calendar: ${date} ${event.title} (${CATEGORY[category].label}).` }], isError: false } }
+    return toolText(`Added to the calendar: ${date} ${event.title} (${CATEGORY[category].label}).`)
   })
 
   on('tool.call', { tool: 'mcp__stock-desk__calendar_list' }, async ($, e) => {
@@ -667,14 +668,14 @@ export const register: Register = on => {
     const today = marketToday()
     const events = buildEvents({ today, horizon: days, calendar: await read($, calendar), tickers: await read($, tickers), watchlist: followed(p, await read($, portfolio)), mine: await read($, myEvents) })
 
-    return { result: { content: [{ type: 'text', text: eventsText(events, today) }], isError: false } }
+    return toolText(eventsText(events, today))
   })
 
   on('tool.call', { tool: 'mcp__stock-desk__show_tickers' }, async ($, e) => {
     const added = await addSymbols($, String((e as unknown as { symbols?: string }).symbols ?? ''))
     await openMain($)
 
-    return { result: { content: [{ type: 'text', text: added.length ? `Showing ${added.join(', ')} in the stock pane.` : 'No valid tickers given.' }], isError: !added.length } }
+    return toolText(added.length ? `Showing ${added.join(', ')} in the stock pane.` : 'No valid tickers given.', !added.length)
   })
 
   on('tool.call', { tool: /^mcp__stock-desk__analyze_ticker$/ }, async ($, e) => {

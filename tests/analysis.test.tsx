@@ -120,4 +120,11 @@ test('beta_map and probability answer from the same history', async ($, on) => {
 
   const bad = resultText(await callTool($, { tool: 'mcp__stock-desk__beta_map', targets: 'TSLA' }))
   expect(bad).toContain('base_target')
+
+  // A registered tool answers with its text as `result` (the engine refuses an MCP-style content object).
+  const answered = (await callTool($, { tool: 'mcp__stock-desk__probability', symbol: 'TSLA', levels: [100], days: 5 })) as { result?: unknown; isError?: boolean }
+  expect(typeof answered.result).toBe('string')
+  const refused = (await callTool($, { tool: 'mcp__stock-desk__beta_map', targets: 'TSLA' })) as { result?: unknown; isError?: boolean }
+  expect(typeof refused.result).toBe('string')
+  expect(refused.isError).toBe(true)
 })
