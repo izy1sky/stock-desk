@@ -344,3 +344,39 @@ test('the futures module scores a strong tech-led overnight rally and fades a cr
   for (const k of ['overnight', 'pre-market', 'regular', 'after close', 'daily break', 'weekend'] as const) expect(sessionText(k).en).toBe(k)
   expectTranslated((['overnight', 'pre-market', 'regular', 'after close', 'daily break', 'weekend'] as const).map(sessionText))
 })
+
+test('the lead contract scores alone: NQ for an NDX fund, ES for an SPX fund, each with its own COT', () => {
+  // No cash quotes: each contract's own change is the move. ES +0.50%, NQ +1.00%.
+  const quotes: FuturesQuote[] = parseCnbcFutures(CNBC_FUTURES, NOW).map(q => ({ ...q, changePct: q.root === 'ES' ? 0.5 : 1 }))
+  const cot = [
+    cotStats(cotRows([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]), NOW, 'ES'), // crowded long: -20
+    cotStats(cotRows(Array.from({ length: 39 }, (_, i) => i).concat([30])), NOW, 'NQ'), // 26w index 66.7: +2.67
+  ]
+  const mean = futuresModule({ quotes, cot, now: NOW })
+  const es = futuresModule({ quotes, cot, now: NOW, lead: 'ES' })
+  const nq = futuresModule({ quotes, cot, now: NOW, lead: 'NQ' })
+
+  expect(mean.stats.lead).toBeUndefined()
+  expect([es.stats.lead, nq.stats.lead]).toEqual(['ES', 'NQ'])
+  close(mean.stats.components.move, 30)
+  close(es.stats.components.move, 20)
+  close(nq.stats.components.move, 40)
+  // Only the lead's positioning counts; without a lead, the mean of both.
+  close(es.stats.components.positioning, -20)
+  close(nq.stats.components.positioning, 2.7, 0.05)
+  close(mean.stats.components.positioning, -8.7, 0.05)
+  expect(nq.score).toBeGreaterThan(es.score)
+  // Both reports still show as readings, whichever leads.
+  for (const m of [mean, es, nq]) expect(m.readings.filter(r => /lev funds net/.test(r.name.en)).length).toBe(2)
+
+  expect(nq.verdict.en).toMatch(/: NQ \+1\.00%, ES \+0\.50% vs settle/)
+  expect(nq.verdict.zh).toContain('较结算价 NQ +1.00%，ES +0.50%')
+  expect(nq.verdict.en).not.toMatch(/crowded/)
+  expect(es.verdict.en).toMatch(/: ES \+0\.50%, NQ \+1\.00% vs settle.*crowded long/)
+  expectTranslated(nq)
+
+  // A lead with no quote (RTY is missing here) falls back to the mean.
+  const rty = futuresModule({ quotes, cot, now: NOW, lead: 'RTY' })
+  expect(rty.stats.lead).toBeUndefined()
+  expect(rty.score).toBe(mean.score)
+})

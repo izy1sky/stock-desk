@@ -125,6 +125,7 @@ test('the language switch turns every pane Chinese, and nothing the mod writes s
   const md = (await ui.findAll({ type: 'Markdown' })).map(t => t.text ?? '').join('\n')
   expect(md).toContain('| 情景 | 目标 | 概率 |')
   expect(md).toContain('| 价格 | 较收盘 | 价位 |')
+  expect(await ui.find({ type: 'Text', text: /置信度 \d\.\d\d · 收盘 / })).toBeDefined()
   expect(await untranslated(ui)).toEqual([])
 
   // Intraday: the session read, its tables and the chart legend.
@@ -134,6 +135,9 @@ test('the language switch turns every pane Chinese, and nothing the mod writes s
   const intraMd = (await ui.findAll({ type: 'Markdown' })).map(t => t.text ?? '').join('\n')
   expect(intraMd).toContain('| 区间 | 低–高 | 状态 |')
   expect(intraMd).toContain('| 价格 | 较现价 | 价位 |')
+  // The market strip above it: SPY and QQQ, in Chinese.
+  expect(await ui.find({ type: 'Button', key: 'market-QQQ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /SPY 代表 SPX，QQQ 代表 NDX/ })).toBeDefined()
   expect({ tab: 'tab-intraday', left: await untranslated(ui) }).toEqual({ tab: 'tab-intraday', left: [] })
 
   // Chart & levels, news and the calendar tab.

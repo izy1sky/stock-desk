@@ -34,6 +34,8 @@ export type Prefs = {
   showPremarket?: boolean
   /** Intraday alerts (first-hour summary, range and VWAP breaks) as toasts; off by default. */
   intradayAlerts?: boolean
+  /** The market strip (SPY and QQQ side by side) above the Analysis and Intraday tabs; on by default. */
+  showMarket?: boolean
   /** The language the panes are written in (default English). */
   lang?: 'en' | 'zh'
   /** The analysis horizon, in trading days. */

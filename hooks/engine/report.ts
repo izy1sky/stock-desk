@@ -5,7 +5,7 @@
 
 import type { AssetClass } from '../../types'
 import { loadHistory } from '../data'
-import { bi, pick, type Lang } from '../i18n'
+import { bi, biasText, pick, type Lang } from '../i18n'
 import { analogs, expectedMoves, probAbove, probTouch, scenarios } from './forecast'
 import type { AnalogStudy, ExpectedMove, Scenarios } from './forecast'
 import {
@@ -21,7 +21,7 @@ import {
   loadIndexHistory,
   projectMove,
 } from './futures'
-import type { BetaStats, CashQuote, CotStats, FuturesQuote, ImpliedCash, IndexSymbol, Projection } from './futures'
+import type { BetaStats, CashQuote, CotStats, FuturesQuote, FuturesRoot, ImpliedCash, IndexSymbol, Projection } from './futures'
 import type { Fetch } from './http'
 import { analyzeChain, fmtGex, loadChain, loadVolIndexes, optionsModule } from './options'
 import type { OptionsLevels, OptionsStats, SkewRead, VolIndexes } from './options'
@@ -45,13 +45,37 @@ export function compositeWeights(days: number): Record<ModuleKey, number> {
   return { trend: 0.5, volume: 0.2, volatility: 0.15, options: 0.1, futures: 0.05 }
 }
 
-/** Tickers whose price is the index (or a fixed multiple of it): futures count in full for them. */
-const INDEX_LINKED = new Set([
-  'SPX', 'XSP', 'SPY', 'VOO', 'IVV', 'SPLG', 'SSO', 'UPRO', 'SPXL', 'SDS', 'SPXU', 'SPXS', 'SH',
-  'NDX', 'QQQ', 'QQQM', 'QLD', 'TQQQ', 'SQQQ', 'PSQ',
-  'DJI', 'DIA', 'UDOW', 'SDOW',
-  'RUT', 'IWM', 'TNA', 'TZA',
-])
+/** Tickers whose price is the index (or a fixed multiple of it), and the futures contract on that index: futures count in full for them. */
+const INDEX_FUTURE: Record<string, FuturesRoot> = {
+  ...Object.fromEntries(['SPX', 'XSP', 'SPY', 'VOO', 'IVV', 'SPLG', 'SSO', 'UPRO', 'SPXL', 'SDS', 'SPXU', 'SPXS', 'SH'].map(s => [s, 'ES'])),
+  ...Object.fromEntries(['NDX', 'QQQ', 'QQQM', 'QLD', 'TQQQ', 'SQQQ', 'PSQ'].map(s => [s, 'NQ'])),
+  ...Object.fromEntries(['DJI', 'DIA', 'UDOW', 'SDOW'].map(s => [s, 'YM'])),
+  ...Object.fromEntries(['RUT', 'IWM', 'TNA', 'TZA'].map(s => [s, 'RTY'])),
+}
+const INDEX_LINKED = new Set(Object.keys(INDEX_FUTURE))
+/** Funds that move against their index: a futures rally is bearish for them. */
+const INVERSE = new Set(['SDS', 'SPXU', 'SPXS', 'SH', 'SQQQ', 'PSQ', 'SDOW', 'TZA'])
+
+/** The futures contract a ticker tracks, if it is an index fund (and whether it is inverse). */
+export function futuresLeadOf(symbol: string): { root: FuturesRoot; inverse: boolean } | undefined {
+  const sym = symbol.toUpperCase()
+  const root = INDEX_FUTURE[sym]
+
+  return root ? { root, inverse: INVERSE.has(sym) } : undefined
+}
+
+/** The futures module for one ticker: its own contract leads, and an inverse fund reads the signal the other way. */
+function futuresFor(sym: string, market: MarketContext): ModuleResult {
+  const lead = futuresLeadOf(sym)
+  const m = slim(futuresModule({ quotes: market.quotes, cash: market.cash, cot: market.cot, lead: lead?.root }))
+  if (!lead?.inverse) return m
+
+  return {
+    ...m,
+    score: -m.score,
+    flags: [bi(`${sym} is an inverse fund: the futures signal counts against it`, `${sym} 是反向基金：期货信号对它的方向相反`), ...m.flags],
+  }
+}
 
 /** Index symbols, which Nasdaq's stock history does not serve, and the ETF that stands in for them in a regression. */
 const INDEX_PROXY: Partial<Record<string, string>> = { SPX: 'SPY', NDX: 'QQQ', DJI: 'DIA', RUT: 'IWM' }
@@ -136,6 +160,20 @@ export type Report = {
   notes: Text[]
   /** Sources that failed: each a short line. */
   errors: string[]
+  /** The numbers a side-by-side comparison needs (absent from reports built before 0.5.0). */
+  key?: KeyStats
+}
+
+export type KeyStats = {
+  ma20?: number
+  ma50?: number
+  ma200?: number
+  adx?: number
+  /** Annualized, decimal. */
+  rv20?: number
+  rvPct1y?: number
+  distributionDays: number
+  accumulationDays: number
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -265,7 +303,7 @@ export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOpti
         `${opts.earningsInDays} 个交易日后发布财报，落在周期之内：可能出现跳空，关键位与模型概率都无法反映。`,
       ),
     )
-  if (market.quotes.length) modules.push(slim(futuresModule({ quotes: market.quotes, cash: market.cash, cot: market.cot })))
+  if (market.quotes.length) modules.push(futuresFor(sym, market))
 
   const comp = composite(modules, horizonDays, INDEX_LINKED.has(sym))
   const { supports, resistances } = keyLevelsDetail(bars, spot)
@@ -298,6 +336,16 @@ export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOpti
     analogs: analogs(bars, { horizons: [...new Set([5, 20, horizonDays])].sort((a, b) => a - b) }),
     notes,
     errors,
+    key: {
+      ma20: trend.stats.ma.ma20,
+      ma50: trend.stats.ma.ma50,
+      ma200: trend.stats.ma.ma200,
+      adx: trend.stats.adx,
+      rv20: volatility.stats.rv20,
+      rvPct1y: volatility.stats.rvPct1y,
+      distributionDays: volume.stats.distributionDays,
+      accumulationDays: volume.stats.accumulationDays,
+    },
   }
 }
 
@@ -420,9 +468,17 @@ export type MarketReport = {
   context: MarketContext
   futures?: ModuleResult
   implied: ImpliedCash[]
+  /** The two indexes the market read covers: SPX through SPY, NDX through QQQ. */
   spy?: Report
+  qqq?: Report
   fetchedAt: number
 }
+
+/** The index funds the market read analyses in full, and the cash index each stands for. */
+export const MARKET_INDEXES = [
+  { symbol: 'SPY', index: 'SPX' },
+  { symbol: 'QQQ', index: 'NDX' },
+] as const
 
 export async function buildMarket(fetch: Fetch, horizonDays = 5): Promise<MarketReport> {
   const context = await loadMarketContext(fetch)
@@ -432,13 +488,88 @@ export async function buildMarket(fetch: Fetch, horizonDays = 5): Promise<Market
     const cash = context.cash.find(c => c.symbol === INDEX_OF[q.root])
     if (cash) implied.push(impliedCash(q, cash))
   }
-  const spy = await buildReport(fetch, 'SPY', { horizonDays, market: context, assetClass: 'etf' }).catch(e => {
-    context.errors.push(`SPY report: ${message(e)}`)
+  const [spy, qqq] = await Promise.all(
+    MARKET_INDEXES.map(({ symbol }) =>
+      buildReport(fetch, symbol, { horizonDays, market: context, assetClass: 'etf' }).catch(e => {
+        context.errors.push(`${symbol} report: ${message(e)}`)
 
-    return undefined
-  })
+        return undefined
+      }),
+    ),
+  )
 
-  return { context, futures: fm && slim(fm), implied, spy, fetchedAt: Date.now() }
+  return { context, futures: fm && slim(fm), implied, spy, qqq, fetchedAt: Date.now() }
+}
+
+/** How two composite reads relate: both one way, split, or both neutral. */
+export function indexAgreement(a: Report, b: Report): Text {
+  const x = a.composite
+  const y = b.composite
+  const side = (s: number) => (s >= 15 ? 1 : s <= -15 ? -1 : 0)
+  const gap = Math.abs(x.score - y.score)
+  if (side(x.score) === 0 && side(y.score) === 0) return bi(`Both ${a.symbol} and ${b.symbol} read neutral.`, `${a.symbol} 与 ${b.symbol} 都是中性。`)
+  if (side(x.score) === side(y.score)) {
+    const dir = side(x.score) > 0 ? 'bullish' : 'bearish'
+    const strong = Math.abs(x.score) >= Math.abs(y.score) ? a : b
+
+    return gap < 10
+      ? bi(`Both lean ${dir}, about equally (${gap} pts apart).`, `两者都${dir === 'bullish' ? '偏多' : '偏空'}，程度相近（相差 ${gap} 分）。`)
+      : bi(`Both lean ${dir}; ${strong.symbol} is the stronger read (${gap} pts apart).`, `两者都${dir === 'bullish' ? '偏多' : '偏空'}；${strong.symbol} 的信号更强（相差 ${gap} 分）。`)
+  }
+
+  return bi(
+    `They disagree: ${a.symbol} ${x.bias} (${sgn(x.score, 0)}), ${b.symbol} ${y.bias} (${sgn(y.score, 0)}). A split market: weigh the index the question is about.`,
+    `两者分歧：${a.symbol} ${biasText(x.bias).zh}（${sgn(x.score, 0)}），${b.symbol} ${biasText(y.bias).zh}（${sgn(y.score, 0)}）。市场分化：以所问的指数为准。`,
+  )
+}
+
+/** SPY and QQQ side by side: the composite, every module, the trend and volatility numbers, analogs and the nearest levels. */
+export function indexComparisonMarkdown(m: MarketReport): string {
+  const reports = [m.spy, m.qqq].filter((r): r is Report => !!r)
+  if (reports.length < 2) return ''
+  const [a, b] = reports as [Report, Report]
+  const col = (f: (r: Report) => string) => `${f(a)} | ${f(b)}`
+  const dist = (r: Report, ma?: number) => (ma ? `${sgn((r.spot / ma - 1) * 100, 1)}%` : '—')
+  const mod = (r: Report, key: ModuleKey) => {
+    const x = r.modules.find(x => x.key === key)
+    if (!x) return '—'
+    const lead = key === 'futures' ? futuresLeadOf(r.symbol)?.root : undefined
+
+    return `${sgn(x.score, 0)} (${x.confidence.toFixed(2)})${lead ? ` · ${lead}` : ''}`
+  }
+  const imp = (r: Report) => {
+    const idx = MARKET_INDEXES.find(x => x.symbol === r.symbol)?.index
+    const i = m.implied.find(x => x.index === idx)
+
+    return i ? `${idx} ${fmtPrice(i.impliedCash)} (${sgn(i.impliedChangePct)}%)` : '—'
+  }
+  const analog5 = (r: Report) => {
+    const h = r.analogs.ok ? r.analogs.horizons.find(x => x.days === 5) : undefined
+
+    return h ? `${h.analogs.winRate.toFixed(0)}% vs ${h.baseline.winRate.toFixed(0)}%, mean ${sgn(h.analogs.mean)}% (n ${h.analogs.n})` : '—'
+  }
+  const near = (r: Report) => `${r.resistances[0] ? fmtPrice(r.resistances[0].price) : '—'} / ${r.supports[0] ? fmtPrice(r.supports[0].price) : '—'}`
+  const move = (r: Report, i: number) => (r.moves[i] ? `±${r.moves[i]!.pct1.toFixed(2)}%` : '—')
+  const rows: [string, string][] = [
+    ['Close', col(r => `${fmtPrice(r.spot)} (${r.asOf})`)],
+    ['Futures-implied index', col(imp)],
+    ['Composite', col(r => `${r.composite.bias} ${sgn(r.composite.score, 0)} (conf ${r.composite.confidence.toFixed(2)}, ${r.composite.agree}/${r.composite.total} agree)`)],
+    ...(['trend', 'volatility', 'volume', 'options', 'futures'] as ModuleKey[]).map(k => [MODULE_NAME[k], col(r => mod(r, k))] as [string, string]),
+    ['Close vs MA20 / MA50 / MA200', col(r => `${dist(r, r.key?.ma20)} / ${dist(r, r.key?.ma50)} / ${dist(r, r.key?.ma200)}`)],
+    ['MA200', col(r => (r.key?.ma200 ? fmtPrice(r.key.ma200) : '—'))],
+    ['ADX(14)', col(r => r.key?.adx?.toFixed(1) ?? '—')],
+    ['RV20 (1y percentile)', col(r => (r.key?.rv20 !== undefined ? `${pctOf(r.key.rv20)} (${r.key.rvPct1y?.toFixed(0) ?? '—'})` : '—'))],
+    ['Distribution / accumulation (25d)', col(r => (r.key ? `${r.key.distributionDays} / ${r.key.accumulationDays}` : '—'))],
+    ['1σ 1 day / 1 week', col(r => `${move(r, 0)} / ${move(r, 1)}`)],
+    ['Analogs 5 days: win vs baseline', col(analog5)],
+    ['Nearest resistance / support', col(near)],
+  ]
+
+  return [
+    `## ${a.symbol} vs ${b.symbol} (SPX vs NDX), horizon ${a.horizonDays} trading days`,
+    `| | ${a.symbol} | ${b.symbol} |\n|---|---|---|\n${rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n')}`,
+    `**${en(indexAgreement(a, b))}**`,
+  ].join('\n\n')
 }
 
 export function marketMarkdown(m: MarketReport): string {
@@ -467,7 +598,9 @@ export function marketMarkdown(m: MarketReport): string {
     cot.length
       ? `COT (Traders in Financial Futures; index = 0 lowest … 100 highest net of the window, 3y / 26w):\n\n| Market | As of | Leveraged funds net | Lev. index 3y/26w | Asset managers net | AM index 3y/26w | Dealers net |\n|---|---|---|---|---|---|---|\n${cot.join('\n')}`
       : 'COT: unavailable',
+    indexComparisonMarkdown(m),
     m.spy ? `## SPY\n\n${reportMarkdown(m.spy)}` : '',
+    m.qqq ? `## QQQ\n\n${reportMarkdown(m.qqq)}` : '',
     ctx.errors.length ? `Data gaps: ${ctx.errors.join('; ')}` : '',
   ]
     .filter(Boolean)

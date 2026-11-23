@@ -14,7 +14,11 @@ For any US stock, ETF or index (SPX, NDX, RUT), the engine scores five modules f
 
 On top: key levels (swing points, averages, option walls), expected moves, bull/base/bear scenarios with lognormal odds, and a historical-analog study (the 40 past days most like today in ten years of prices, and what followed).
 
+Index funds score the futures of their own index: SPY, VOO and UPRO lead with ES; QQQ, TQQQ and SQQQ with NQ (its move and its COT); inverse funds read the signal the other way.
+
 Claude gets the tools `analyze_ticker`, `market_overview`, `options_positioning`, `beta_map` ("SPX to 7500: where are SOXL and TQQQ?") and `probability` (odds of closing above or touching a level), and the `stock-desk:analyze` skill that says how to read them. The pane's Analysis tab shows the same report.
+
+**The market is SPX and NDX**: `market_overview` analyses SPY and QQQ in full, with a side-by-side table (composite, every module, distance from the 20/50/200-day averages, ADX, realized vol, distribution days, analogs, nearest levels) and whether the two agree. `market_intraday` does the same for today's session (SPY and QQQ, or the ES and NQ futures before the open). Above the Analysis and Intraday tabs, a market strip shows both indexes' reads; press one to open it, or hide the strip.
 
 **Intraday**: the Intraday (盘中) tab and the `intraday_read` tool read today's session in real time from 1-minute bars — the gap and pre-market range, the 5/15/30-minute opening ranges and the first-hour range (initial balance) with breakout status, VWAP and its bands, relative volume by time of day, the opening type (open-drive, test-drive, rejection-reverse, auction), sector breadth and equal- vs cap-weight, VIX, today's options levels, a first-hour timeline of how the read formed, and past sessions that looked like today at the same clock time. It refreshes every minute in the first hour (then every 3 minutes), keeps a summary of each session to grow its history, and can raise alerts at 10:30 and on breaks of the first-hour range, VWAP or the gamma flip (off by default).
 

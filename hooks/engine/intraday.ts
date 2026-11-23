@@ -1602,14 +1602,24 @@ export function summarizeDay(data: IntradayData): DaySummary | undefined {
 const en = (t: Text | string | number | undefined) => (t === undefined ? '' : typeof t === 'object' ? t.en : String(t))
 const cell = (s: string) => s.replace(/\|/g, '\\|')
 
-export function intradayMarkdown(read: IntradayRead): string {
+/** Readings and notes about the whole market (breadth, leadership, VIX, the data sources): the same in every ticker's read. */
+const SHARED_READINGS = new Set(['Breadth', 'Leadership (pts vs SPY)', 'VIX'])
+const isSharedNote = (n: Text) => n.en.startsWith('Breadth comes from') || n.en.startsWith('Bars: CNBC')
+const readingLine = (r: Reading) => `- ${en(r.name)}: ${typeof r.value === 'number' ? +r.value.toFixed(4) : en(r.value)}${r.note && r.note.en ? ` (${r.note.en})` : ''}`
+
+/** `shared: false` leaves out the market-wide readings and notes, for a read printed next to another that carries them. */
+export function intradayMarkdown(read: IntradayRead, opts: { shared?: boolean } = {}): string {
+  const shared = opts.shared !== false
   const f = fmtPrice
   const vs = (p: number) => `${sg((p / read.price - 1) * 100, 2)}%`
   const out: string[] = [
     `# ${read.symbol} intraday — ${read.bias}, score ${sg(read.score, 0)} (confidence ${read.confidence.toFixed(2)}), ${read.phase}, ${read.asOf}`,
     `Price ${f(read.price)} (${pctTxt(read.changePct)} vs prior close)${read.open !== undefined ? ` · open ${f(read.open)}` : ''} · ${read.minutesSinceOpen >= 0 ? `${Math.min(read.minutesSinceOpen, 390)} min since the open` : `${-read.minutesSinceOpen} min to the open`} · open type ${read.openType}`,
     `**${en(read.verdict)}**`,
-    read.readings.map(r => `- ${en(r.name)}: ${typeof r.value === 'number' ? +r.value.toFixed(4) : en(r.value)}${r.note && r.note.en ? ` (${r.note.en})` : ''}`).join('\n'),
+    read.readings
+      .filter(r => shared || !SHARED_READINGS.has(r.name.en))
+      .map(readingLine)
+      .join('\n'),
   ]
   if (read.flags.length) out.push(read.flags.map(x => `- ⚑ ${x.en}`).join('\n'))
   if (read.levels.length)
@@ -1633,10 +1643,84 @@ export function intradayMarkdown(read: IntradayRead): string {
         `${s.dates.length ? ` Dates: ${s.dates.slice(0, 12).join(', ')}${s.dates.length > 12 ? ', …' : ''}.` : ''} ${s.note.en}`,
     )
   else out.push('Session study: from 09:45 during the regular session.')
-  out.push(...read.notes.map(n => `⚠ ${n.en}`))
+  out.push(...read.notes.filter(n => shared || !isSharedNote(n)).map(n => `⚠ ${n.en}`))
   out.push(read.errors.length ? `Data gaps: ${read.errors.join('; ')}` : 'All sources answered.')
 
   return out.join('\n\n')
+}
+
+// ---------------------------------------------------------------- two indexes side by side
+
+/** The nearest level above and below the price, for a compact row. */
+export function nearestLevels(read: IntradayRead): { above?: IntradayLevel; below?: IntradayLevel } {
+  const above = read.levels.filter(l => l.price > read.price).sort((a, b) => a.price - b.price)[0]
+  const below = read.levels.filter(l => l.price < read.price).sort((a, b) => b.price - a.price)[0]
+
+  return { above, below }
+}
+
+/** How two intraday leans relate, and which index is moving more. */
+export function intradayAgreement(a: IntradayRead, b: IntradayRead): Text {
+  const side = (s: number) => (s >= 15 ? 1 : s <= -15 ? -1 : 0)
+  const spread = b.changePct - a.changePct
+  const lead = Math.abs(spread) < 0.25 ? undefined : spread > 0 ? b.symbol : a.symbol
+  const leadText = lead
+    ? bi(` ${lead} is the stronger index today (${b.symbol} − ${a.symbol} ${sg(spread, 2)} pts).`, `今天 ${lead} 更强（${b.symbol} − ${a.symbol} ${sg(spread, 2)} 个百分点）。`)
+    : bi(` They move together (${b.symbol} − ${a.symbol} ${sg(spread, 2)} pts).`, `两者同步（${b.symbol} − ${a.symbol} ${sg(spread, 2)} 个百分点）。`)
+  const sa = side(a.score)
+  const sb = side(b.score)
+  let lean: Text
+  if (sa === 0 && sb === 0) lean = bi('Both leans are neutral.', '两者的倾向都是中性。')
+  else if (sa === sb) lean = sa > 0 ? bi('Both lean up for the rest of the day.', '两者在剩余时段都偏多。') : bi('Both lean down for the rest of the day.', '两者在剩余时段都偏空。')
+  else
+    lean = bi(
+      `The leans differ: ${a.symbol} ${a.bias} (${sg(a.score, 0)}), ${b.symbol} ${b.bias} (${sg(b.score, 0)}): a split tape, so trust neither index's breakout alone.`,
+      `两者倾向不同：${a.symbol} ${biasText(a.bias).zh}（${sg(a.score, 0)}），${b.symbol} ${biasText(b.bias).zh}（${sg(b.score, 0)}）：走势分化，单一指数的突破都不要轻信。`,
+    )
+
+  return bi(lean.en + leadText.en, lean.zh + leadText.zh)
+}
+
+/** SPY and QQQ (or ES and NQ) read side by side: a comparison table, the market-wide context once, then each read without it. */
+export function marketIntradayMarkdown(reads: IntradayRead[]): string {
+  if (reads.length === 0) return 'No intraday reads.'
+  if (reads.length === 1) return intradayMarkdown(reads[0]!)
+  const [a, b] = reads as [IntradayRead, IntradayRead]
+  const f = fmtPrice
+  const col = (fn: (r: IntradayRead) => string) => `${cell(fn(a))} | ${cell(fn(b))}`
+  const range = (r: IntradayRead, minutes: 30 | 60) => {
+    const x = r.ranges.find(y => y.minutes === minutes)
+
+    return x ? `${f(x.low)}–${f(x.high)} (${x.status})` : '—'
+  }
+  const level = (l?: IntradayLevel) => (l ? `${f(l.price)} ${l.label.en}` : '—')
+  const rows: [string, string][] = [
+    ['Price', col(r => `${f(r.price)} (${pctTxt(r.changePct)})`)],
+    ['Phase', col(r => `${r.phase}, ${r.minutesSinceOpen >= 0 ? `${Math.min(r.minutesSinceOpen, 390)} min in` : `${-r.minutesSinceOpen} min to the open`}`)],
+    ['Gap', col(r => `${pctTxt(r.gap.pct)}${r.gap.vsAtr !== undefined ? ` (${r.gap.vsAtr.toFixed(2)}× ATR)` : ''}${r.gap.direction === 'flat' ? '' : r.gap.filled ? ', filled' : ', open'}`)],
+    ['Open type', col(r => r.openType)],
+    ['vs VWAP', col(r => (r.vwap ? `${pctTxt(r.vwap.vsPct)} (VWAP ${f(r.vwap.value)})` : '—'))],
+    ['30-min range', col(r => range(r, 30))],
+    ['First hour (IB)', col(r => range(r, 60))],
+    ['Relative volume', col(r => (r.rvol ? `${r.rvol.value.toFixed(2)}×` : '—'))],
+    ['Lean, rest of day', col(r => `${r.bias} ${sg(r.score, 0)} (conf ${r.confidence.toFixed(2)})`)],
+    ['Sessions like today', col(r => (r.study ? `${r.study.closeAboveNow.toFixed(0)}% closed higher vs ${r.study.baseline.closeAboveNow.toFixed(0)}% (n ${r.study.n})` : '—'))],
+    ['Nearest level above', col(r => level(nearestLevels(r).above))],
+    ['Nearest level below', col(r => level(nearestLevels(r).below))],
+  ]
+  const shared = a.readings.filter(r => SHARED_READINGS.has(r.name.en))
+
+  return [
+    `# Market intraday — ${a.symbol} and ${b.symbol}, ${a.asOf}`,
+    `| | ${a.symbol} | ${b.symbol} |\n|---|---|---|\n${rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n')}`,
+    `**${intradayAgreement(a, b).en}**`,
+    shared.length ? `Market-wide (both reads):\n${shared.map(readingLine).join('\n')}` : '',
+    ...a.notes.filter(isSharedNote).map(n => `⚠ ${n.en}`),
+    `---\n\n${intradayMarkdown(a, { shared: false })}`,
+    `---\n\n${intradayMarkdown(b, { shared: false })}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
 }
 
 // ---------------------------------------------------------------- everything for one ticker

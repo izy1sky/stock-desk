@@ -10,14 +10,14 @@ import { buildEvents, CATEGORY, categoryLabel, myEventHint, parseMyEvent } from 
 import type { CalEvent } from './events'
 import { levelRows, sessionsMarkdown, statRows } from './levels'
 import type { Row } from './levels'
-import { betaMarkdown, buildBetaMap, buildMarket, buildOptions, buildProbabilities, buildReport, loadMarketContext, marketMarkdown, moduleLabel, optionsReportMarkdown, probabilitiesMarkdown, reportMarkdown, scoreBar } from './engine/report'
+import { betaMarkdown, buildBetaMap, buildMarket, buildOptions, buildProbabilities, buildReport, indexAgreement, loadMarketContext, MARKET_INDEXES, marketMarkdown, moduleLabel, optionsReportMarkdown, probabilitiesMarkdown, reportMarkdown, scoreBar } from './engine/report'
 import type { MarketContext, Report } from './engine/report'
 import { skewReadText } from './engine/options'
 import type { SkewRead } from './engine/options'
 import { fmtPrice, levelKindText } from './engine/technicals'
 import { agoText, biasText, dayLabel as dayLabelIn, etTime, LANGS, pick, relativeDays, tr } from './i18n'
 import type { Lang } from './i18n'
-import { analyzeIntraday, buildIntraday, intradayMarkdown, levelKindTextIntraday, loadBreadth, loadIntraday, openTypeText, phaseText, rangeStatusText, summarizeDay } from './engine/intraday'
+import { analyzeIntraday, buildIntraday, intradayAgreement, intradayMarkdown, levelKindTextIntraday, loadBreadth, loadIntraday, marketIntradayMarkdown, nearestLevels, openTypeText, phaseText, rangeStatusText, summarizeDay } from './engine/intraday'
 import type { Breadth, DaySummary, IntradayData, IntradayRead, OptionsContext } from './engine/intraday'
 import { intradayChart } from './intraday-chart'
 import { chartPage } from './page'
@@ -134,6 +134,7 @@ const SOURCE_ZH: [RegExp, string][] = [
   [/^COT (\w+)$/, 'COT 持仓 $1'],
   [/^VIX indexes$/, 'VIX 系列指数'],
   [/^SPY report$/, 'SPY 分析'],
+  [/^QQQ report$/, 'QQQ 分析'],
 ]
 
 function sourceError(err: string, lang: Lang): string {
@@ -275,10 +276,19 @@ async function refreshReport($: $, symbol: string, horizon: number, force = fals
   }
 }
 
-/** Refreshes the selected ticker's report when the Analysis tab shows it. */
+/** The index funds the market strip shows above the Analysis and Intraday tabs. */
+const MARKET_SYMBOLS: string[] = MARKET_INDEXES.map(x => x.symbol)
+const MARKET_FUTURES = ['@SP.1', '@ND.1']
+const showsMarket = (p: Prefs) => p.showMarket !== false
+
+/** Refreshes the selected ticker's report when the Analysis tab shows it, and SPY and QQQ for the market strip. */
 async function refreshShownReport($: $, force = false): Promise<void> {
   const p = await read($, prefs)
-  if (p.tab === 'analysis' && p.selected) await refreshReport($, p.selected, horizonOf(p), force).catch(() => undefined)
+  if (p.tab !== 'analysis') return
+  const symbols = new Set<string>(p.selected ? [p.selected] : [])
+  if (showsMarket(p)) for (const s of MARKET_SYMBOLS) symbols.add(s)
+  // The strip's reads are context: only the shown ticker's is forced.
+  await Promise.all([...symbols].map(s => refreshReport($, s, horizonOf(p), force && s === p.selected).catch(() => undefined)))
 }
 
 // A registered tool answers with its text as `result`; `isError` sits beside it.
@@ -322,16 +332,45 @@ function intradayCadenceMs(now = Date.now()): number | undefined {
   return undefined
 }
 
+let breadthLoading: Promise<Breadth | undefined> | undefined
+
+/** Sector breadth, shared by every intraday read: one load a minute, and reads that ask at once share it. */
 async function breadthNow($: $): Promise<Breadth | undefined> {
   if (breadthCache && Date.now() - breadthAt < 60_000) return breadthCache
-  try {
-    breadthCache = await loadBreadth(fetcher($))
-    breadthAt = Date.now()
-  } catch {
-    // Breadth is context: the read goes on without it and says so.
-  }
+  breadthLoading ??= (async () => {
+    try {
+      breadthCache = await loadBreadth(fetcher($))
+      breadthAt = Date.now()
+    } catch {
+      // Breadth is context: the read goes on without it and says so.
+    } finally {
+      breadthLoading = undefined
+    }
 
-  return breadthCache
+    return breadthCache
+  })()
+
+  return breadthLoading
+}
+
+// The 5-minute history behind each intraday read (~120 days) changes only
+// when a session ends: keep it a while per URL, so reading SPY and QQQ beside
+// the shown ticker every minute costs one small request each.
+const HIST_TTL = 20 * 60_000
+const histCache = new Map<string, { at: number; res: Awaited<ReturnType<$['http']['fetch']>> }>()
+
+const intradayFetcher = ($: $) => {
+  const f = fetcher($)
+
+  return async (url: string, init?: Parameters<$['http']['fetch']>[1]) => {
+    if (!url.includes('/harmony/app/bars/') || !url.includes('/5M/')) return f(url, init)
+    const have = histCache.get(url)
+    if (have && Date.now() - have.at < HIST_TTL) return have.res
+    const res = await f(url, init)
+    if (res.ok) histCache.set(url, { at: Date.now(), res })
+
+    return res
+  }
 }
 
 /** Gamma flip, walls, max pain and today's straddle move: the option chain is large, so it reloads every 10 minutes at most. */
@@ -412,8 +451,7 @@ async function refreshIntraday($: $, symbol: string, force = false): Promise<Int
   if ((await read($, busy)).includes(key)) return have
   await update($, busy, list => [...list, key])
   try {
-    const f = fetcher($)
-    const [data, breadth, options, archive] = await Promise.all([loadIntraday(f, symbol), breadthNow($), optionsContext($, symbol), readArchive($)])
+    const [data, breadth, options, archive] = await Promise.all([loadIntraday(intradayFetcher($), symbol), breadthNow($), optionsContext($, symbol), readArchive($)])
     const daily = await reportOf($, symbol)
     const readNow = analyzeIntraday(data, {
       breadth,
@@ -440,13 +478,14 @@ async function refreshIntraday($: $, symbol: string, force = false): Promise<Int
   }
 }
 
-/** Refreshes the shown ticker when the Intraday tab is open (and, with alerts on, the tickers whose reads are kept). */
+/** Refreshes the shown ticker and the market strip's SPY and QQQ when the Intraday tab is open (and, with alerts on, the tickers whose reads are kept). */
 async function refreshShownIntraday($: $, force = false): Promise<void> {
   const p = await read($, prefs)
   const symbols = new Set<string>()
   if (p.tab === 'intraday' && p.selected) symbols.add(p.selected)
+  if (p.tab === 'intraday' && showsMarket(p)) for (const s of MARKET_SYMBOLS) symbols.add(s)
   if (p.intradayAlerts) for (const sym of Object.keys(await read($, intraday))) symbols.add(sym)
-  await Promise.all([...symbols].map(sym => refreshIntraday($, sym, force).catch(() => undefined)))
+  await Promise.all([...symbols].map(sym => refreshIntraday($, sym, force && (sym === p.selected || !MARKET_SYMBOLS.includes(sym))).catch(() => undefined)))
 }
 
 const toolText = (text: string, isError = false) => (isError ? { result: text, isError: true as const } : { result: text })
@@ -484,6 +523,12 @@ async function select($: $, symbol: string): Promise<void> {
   await setPrefs($, p => ({ ...p, selected: symbol }))
   await refreshTicker($, symbol)
   await Promise.all([refreshShownReport($), refreshShownIntraday($)])
+}
+
+/** Opens SPY or QQQ from the market strip: kept in All (not in the open group), then selected. */
+async function selectMarket($: $, symbol: string): Promise<void> {
+  await setPrefs($, p => ({ ...p, watchlist: merge(p.watchlist, [symbol]) }))
+  await select($, symbol)
 }
 
 /** In a group, takes the ticker out of that group only; in All, out of everything. */
@@ -765,8 +810,8 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'market_overview',
       description:
-        'The US market read: ES/NQ/YM/RTY futures with the cash index level they imply (pre-market too), the VIX / VIX9D / VIX3M / VVIX / SKEW term structure, CFTC COT positioning of leveraged funds, asset managers and dealers in ES and NQ, and a full SPY analysis. Use for questions about the market as a whole, the pre-market, or as context before analysing a single stock.',
-      inputSchema: { type: 'object', properties: { horizon_days: { type: 'integer', minimum: 1, maximum: 120, description: 'Horizon for the SPY analysis (default 5)' } } },
+        'The US market read: ES/NQ/YM/RTY futures with the cash index level they imply (pre-market too), the VIX / VIX9D / VIX3M / VVIX / SKEW term structure, CFTC COT positioning of leveraged funds, asset managers and dealers in ES and NQ, and a full analysis of both SPY (SPX) and QQQ (NDX) with a side-by-side comparison. Use for questions about the market as a whole, the pre-market, or as context before analysing a single stock.',
+      inputSchema: { type: 'object', properties: { horizon_days: { type: 'integer', minimum: 1, maximum: 120, description: 'Horizon for the SPY and QQQ analyses (default 5)' } } },
       isDeferred: false,
     })
     await $.tool.register({
@@ -798,6 +843,16 @@ export const register: Register = on => {
       description:
         "Real-time read of today's session for one US stock or ETF (also '@SP.1' / '@ND.1' futures): the gap and pre-market range, the 5/15/30-minute opening ranges and the initial balance (first hour) with breakout status, VWAP and its bands, relative volume by time of day, the opening type (open-drive, test-drive, rejection-reverse, auction), breadth and leadership from sector ETFs and equal- vs cap-weight, VIX, the options levels that matter today (gamma flip, walls, straddle move), past sessions that looked like today at the same clock time and what they did next, and a lean for the rest of the day with scenarios and every intraday level. Real-time 1-minute data. Shows it in the stock-desk pane's Intraday tab. Use for 'how is today going', the open, the first hour, or intraday levels.",
       inputSchema: { type: 'object', properties: { symbol: { type: 'string', description: 'US ticker, e.g. "SPY", "QQQ", "NVDA"' } }, required: ['symbol'] },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'market_intraday',
+      description:
+        "Real-time read of today's session for the market as a whole: SPY (SPX) and QQQ (NDX) side by side, or the ES and NQ futures with use='futures' (best before the open). A comparison table (price, gap, VWAP, opening ranges, open type, relative volume, lean, similar sessions, nearest levels), which index leads and whether their leans agree, the market-wide breadth and VIX once, then each index's full intraday read with its levels and scenarios. Use for 'how is the market doing today', the open, the first hour, or any intraday question about SPX, NDX or the futures.",
+      inputSchema: {
+        type: 'object',
+        properties: { use: { type: 'string', enum: ['etf', 'futures'], description: "'etf' (default): SPY and QQQ. 'futures': @SP.1 (ES) and @ND.1 (NQ)." } },
+      },
       isDeferred: false,
     })
     await $.tool.register({
@@ -945,12 +1000,31 @@ export const register: Register = on => {
     }
   })
 
+  on('tool.call', { tool: /^mcp__stock-desk__market_intraday$/ }, async ($, e) => {
+    const use = String((e as unknown as { use?: string }).use ?? 'etf').toLowerCase() === 'futures' ? 'futures' : 'etf'
+    const symbols = use === 'futures' ? MARKET_FUTURES : MARKET_SYMBOLS
+    // One index failing still answers with the other, and says which is missing.
+    const settled = await Promise.allSettled(symbols.map(s => refreshIntraday($, s, true)))
+    const reads: IntradayRead[] = []
+    const problems: string[] = []
+    settled.forEach((r, i) => {
+      if (r.status === 'rejected') problems.push(`${symbols[i]}: ${errorText(r.reason)}`)
+      else if (!r.value) problems.push(`${symbols[i]}: already loading, try again in a few seconds`)
+      else reads.push(r.value.read)
+    })
+    if (!reads.length) return toolText(`Market intraday read failed: ${problems.join('; ')}`, true)
+    await setPrefs($, p => ({ ...p, tab: 'intraday', showMarket: true }))
+    await openMain($)
+
+    return toolText(marketIntradayMarkdown(reads) + (problems.length ? `\n\nMissing: ${problems.join('; ')}` : ''))
+  })
+
   on('tool.call', { tool: /^mcp__stock-desk__market_overview$/ }, async ($, e) => {
     const horizon = Math.max(1, Math.min(120, Math.round(Number((e as unknown as { horizon_days?: number }).horizon_days ?? 5)) || 5))
     try {
       const market = await buildMarket(fetcher($), horizon)
       marketCache = market.context
-      if (market.spy) await update($, reports, all => ({ ...all, SPY: market.spy! }))
+      await update($, reports, all => ({ ...all, ...(market.spy ? { SPY: market.spy } : {}), ...(market.qqq ? { QQQ: market.qqq } : {}) }))
 
       return toolText(marketMarkdown(market))
     } catch (error) {
@@ -1702,6 +1776,119 @@ export const register: Register = on => {
       )
     }
 
+    // ---- the market strip: SPY (SPX) and QQQ (NDX) side by side above the Analysis and Intraday tabs
+    const marketTab = p.tab === 'analysis' || p.tab === 'intraday'
+    const stripRows =
+      marketTab && showsMarket(p) ? await Promise.all(MARKET_SYMBOLS.map(async sym => ({ sym, report: await reportOf($, sym), entry: await intradayOf($, sym) }))) : []
+    const tone = (n: number) => (n >= 15 ? upColor(p) : n <= -15 ? downColor(p) : 'subtle')
+    const pctS = (n: number, d = 2) => `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`
+    const biasWord = (b: Report['composite']['bias']) => (lang === 'zh' ? biasText(b).zh : b)
+    const [s0, s1] = stripRows
+    const agreement =
+      p.tab === 'intraday'
+        ? s0?.entry && s1?.entry
+          ? intradayAgreement(s0.entry.read, s1.entry.read)
+          : undefined
+        : s0?.report && s1?.report
+          ? indexAgreement(s0.report, s1.report)
+          : undefined
+    const marketStrip = !marketTab ? undefined : !showsMarket(p) ? (
+      <Button key="market-show" plain dimColor onPress={() => void setPrefs($, x => ({ ...x, showMarket: true })).then(() => Promise.all([refreshShownReport($), refreshShownIntraday($)]))}>
+        {L('Show the market: SPY and QQQ', '显示大盘：SPY 与 QQQ')}
+      </Button>
+    ) : (
+      <Box flexDirection="column" paddingX={1} borderStyle="round" borderColor="#3b4048">
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          <Text weight="semibold">{L('Market', '大盘')}</Text>
+          <Text dimColor size="footnote">
+            {p.tab === 'intraday' ? L('· today · SPY for SPX, QQQ for NDX', '· 今日 · SPY 代表 SPX，QQQ 代表 NDX') : L(`· next ${horizonOf(p)} sessions · SPY for SPX, QQQ for NDX`, `· 未来 ${horizonOf(p)} 个交易日 · SPY 代表 SPX，QQQ 代表 NDX`)}
+          </Text>
+          <Button key="market-hide" plain dimColor onPress={() => void setPrefs($, x => ({ ...x, showMarket: false }))}>
+            {L('Hide', '隐藏')}
+          </Button>
+        </Box>
+        {stripRows.map(({ sym, report, entry }) => {
+          const pick1 = sym === p.selected
+          const name = (
+            <Button key={`market-${sym}`} plain={pick1 ? undefined : true} variant={pick1 ? 'primary' : undefined} onPress={() => void selectMarket($, sym)}>
+              {sym}
+            </Button>
+          )
+          if (p.tab === 'intraday') {
+            const r = entry?.read
+            const ib = r?.ranges.find(x => x.minutes === 60)
+            const or30 = r?.ranges.find(x => x.minutes === 30)
+            const range = ib?.complete ? ib : or30
+
+            return (
+              <Box key={`mkt-${sym}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
+                {name}
+                {r ? (
+                  <Text tabular>
+                    {fmtPrice(r.price)} <Text color={r.changePct >= 0 ? upColor(p) : downColor(p)}>{pctS(r.changePct)}</Text>
+                    <Text dimColor>
+                      {r.vwap ? ` · VWAP ${pctS(r.vwap.vsPct)}` : ''}
+                      {range ? L(` · ${range.minutes === 60 ? 'first hour' : '30 min'} ${pick('en', rangeStatusText(range.status))}`, ` · ${range.minutes === 60 ? '首小时' : '30 分钟'}${pick('zh', rangeStatusText(range.status))}`) : ''} ·{' '}
+                    </Text>
+                    <Text color={tone(r.score)} weight="semibold">
+                      {biasWord(r.bias)} {r.score >= 0 ? '+' : ''}
+                      {r.score}
+                    </Text>
+                  </Text>
+                ) : (
+                  <Text dimColor>{loading.includes(`#intraday:${sym}`) ? L('loading…', '加载中…') : L('no read yet', '暂无数据')}</Text>
+                )}
+              </Box>
+            )
+          }
+          const c = report?.composite
+          const ma200 = report?.key?.ma200
+
+          return (
+            <Box key={`mkt-${sym}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
+              {name}
+              {report && c ? (
+                <Text tabular>
+                  <Text color={tone(c.score)} weight="semibold">
+                    {biasWord(c.bias)} {c.score >= 0 ? '+' : ''}
+                    {c.score}
+                  </Text>
+                  <Text dimColor>
+                    {L(` · conf ${c.confidence.toFixed(2)} · close ${fmtPrice(report.spot)} (${report.asOf})`, ` · 置信度 ${c.confidence.toFixed(2)} · 收盘 ${fmtPrice(report.spot)}（${report.asOf}）`)}
+                    {ma200 ? L(` · MA200 ${pctS((report.spot / ma200 - 1) * 100, 1)}`, ` · 距 200 日均线 ${pctS((report.spot / ma200 - 1) * 100, 1)}`) : ''}
+                  </Text>
+                </Text>
+              ) : (
+                <Text dimColor>{loading.includes(`#report:${sym}`) ? L('analysing…', '分析中…') : L('no read yet', '暂无数据')}</Text>
+              )}
+            </Box>
+          )
+        })}
+        {agreement && <Text dimColor size="footnote">{pick(lang, agreement)}</Text>}
+        <Button
+          key="ask-market"
+          plain
+          onPress={() =>
+            void $.prompt.submit({
+              text:
+                p.tab === 'intraday'
+                  ? L(
+                      'Use the stock-desk analyze skill and the market intraday read to tell me how the market is doing today: SPX (SPY) and NDX (QQQ) side by side, the lean for the rest of the day, the levels that matter, what would change it, and the risks.',
+                      '用 stock-desk analyze 技能和大盘盘中分析，告诉我今天大盘的走势：SPX（SPY）与 NDX（QQQ）对比、剩余时段的倾向、关键价位、什么会改变判断，以及风险。',
+                    )
+                  : L(
+                      `Use the stock-desk analyze skill for a read on the market over the next ${horizonOf(p)} trading days: SPX (SPY) and NDX (QQQ) side by side, with futures and positioning, key levels, scenarios, what would change the view, and the risks.`,
+                      `用 stock-desk analyze 技能分析未来 ${horizonOf(p)} 个交易日的大盘：SPX（SPY）与 NDX（QQQ）对比，含期货与持仓、关键价位、情景、什么会改变判断，以及风险。`,
+                    ),
+              asUser: true,
+            })
+          }
+        >
+          {L('Ask Claude about the market', '问 Claude 大盘走势')}
+        </Button>
+      </Box>
+    )
+
     const isLoading =
       loading.includes(p.selected) ||
       (p.tab === 'calendar' && loading.includes('#calendar')) ||
@@ -1714,6 +1901,7 @@ export const register: Register = on => {
         {addField}
         {header}
         {tabs}
+        {marketStrip}
         {body}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           <Button key="refresh" onPress={() => void Promise.all([refreshTicker($, p.selected, true), refreshCalendar($, true), refreshShownReport($, true), refreshShownIntraday($, true)])}>

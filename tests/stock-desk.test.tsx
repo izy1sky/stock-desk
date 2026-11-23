@@ -168,10 +168,14 @@ test('the calendar pane gathers earnings, data, holidays, your events and Claude
   expect(await cal.find({ type: 'Text', text: /Market closed: (Thanksgiving|Christmas|New Year)/ })).toBeDefined()
   expect(await cal.find({ type: 'Text', text: /options expiration|Quad witching/ })).toBeDefined()
 
-  await cal.input({ key: 'add-event', text: 'Nov 20 Nvidia GTC keynote' })
+  // Dates a week or two out, so the test holds whatever day it runs.
+  const soon = (days: number) => new Date(Date.now() + days * 86_400_000)
+  const keynote = soon(7)
+  const funding = soon(9).toISOString().slice(0, 10)
+  await cal.input({ key: 'add-event', text: `${keynote.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} ${keynote.getUTCDate()} Nvidia GTC keynote` })
   expect(await cal.find({ type: 'Text', text: /Nvidia GTC keynote/ })).toBeDefined()
 
-  await $.tool.call({ tool: 'mcp__stock-desk__calendar_add', date: '2026-11-25', title: 'Funding deadline', category: 'politics', importance: 3 })
+  await $.tool.call({ tool: 'mcp__stock-desk__calendar_add', date: funding, title: 'Funding deadline', category: 'politics', importance: 3 })
   expect(await cal.find({ type: 'Text', text: /Funding deadline/ })).toBeDefined()
 
   await cal.press({ key: 'cat-politics' })

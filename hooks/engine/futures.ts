@@ -828,6 +828,8 @@ export function leveragedCompound(dailyMovesPct: number[], leverage: number): { 
 
 export type FuturesStats = {
   session?: FuturesSession
+  /** The contract scored alone (the ticker's own index), when one was given and quoted. */
+  lead?: FuturesRoot
   /** Change from prior settlement, percent, per root. */
   changePct: Partial<Record<FuturesRoot, number>>
   /** The move scored: implied cash move when the cash quote is there, else the futures' own change. */
@@ -849,24 +851,32 @@ const pct = (n: number, digits = 2) => `${n >= 0 ? '+' : ''}${n.toFixed(digits)}
  * Futures read for the US index market.
  *
  * Score (−100..100), the sum of:
- * - move: the mean ES/NQ move, measured as the futures-implied cash move
+ * - move: the lead contract's move (ES for SPX funds, NQ for NDX funds…),
+ *   or the mean ES/NQ move without one, measured as the futures-implied cash move
  *   against the latest cash close (or the futures' change from settlement
  *   without cash quotes), scaled so a typical 1% daily move = 40 points;
  *   capped at ±50.
  * - relative: NQ leading ES is risk appetite (8 points per 0.5 pp), ±15.
  * - basis: ±5 when the ES basis is outside a normal carry (rich basis =
  *   demand for longs, discount = hedging).
- * - positioning (COT, leveraged funds, averaged over the reports given):
+ * - positioning (COT, leveraged funds: the lead's report, else the mean of those given):
  *   contrarian at the extremes of the 3-year COT index (≥ 90 → −20, ≤ 10 →
  *   +20), since a crowded speculative side has to unwind; in between, mildly
  *   trend-following on the 26-week index ((index − 50) / 50 × 8), since
  *   funds building a position tends to go with the flow.
  */
-export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[]; cot?: CotStats | CotStats[]; now?: number }): ModuleResult & { stats: FuturesStats } {
+export function futuresModule(input: {
+  quotes: FuturesQuote[]
+  cash?: CashQuote[]
+  cot?: CotStats | CotStats[]
+  now?: number
+  /** The contract the ticker tracks (ES for SPX funds, NQ for NDX funds…): its move and its COT are scored alone. Without it, the ES/NQ mean. */
+  lead?: FuturesRoot
+}): ModuleResult & { stats: FuturesStats } {
   const now = input.now ?? Date.now()
   const byRoot = new Map(input.quotes.map(q => [q.root, q]))
   const cashBy = new Map((input.cash ?? []).map(c => [c.symbol, c]))
-  const cots = input.cot === undefined ? [] : Array.isArray(input.cot) ? input.cot : [input.cot]
+  const allCots = input.cot === undefined ? [] : Array.isArray(input.cot) ? input.cot : [input.cot]
 
   const implied: Partial<Record<FuturesRoot, ImpliedCash>> = {}
   const changePct: Partial<Record<FuturesRoot, number>> = {}
@@ -878,19 +888,24 @@ export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[
     movePct[q.root] = implied[q.root]?.impliedChangePct ?? q.changePct
   }
 
+  // A lead without a quote falls back to the market mean.
+  const lead = input.lead !== undefined && movePct[input.lead] !== undefined ? input.lead : undefined
   const es = movePct.ES
   const nq = movePct.NQ
   const core = [es, nq].filter((x): x is number => x !== undefined)
   const fallback = [movePct.YM, movePct.RTY].filter((x): x is number => x !== undefined)
-  const moves = core.length ? core : fallback
+  const moves = lead ? [movePct[lead]!] : core.length ? core : fallback
   const avgMove = moves.length ? moves.reduce((s, x) => s + x, 0) / moves.length : undefined
 
   const move = avgMove === undefined ? 0 : Math.max(-50, Math.min(50, (avgMove / 1) * 40))
   const nqMinusEs = es !== undefined && nq !== undefined ? rnd(nq - es, 3) : undefined
   const rtyMinusEs = es !== undefined && movePct.RTY !== undefined ? rnd(movePct.RTY - es, 3) : undefined
   const relative = nqMinusEs === undefined ? 0 : Math.max(-15, Math.min(15, (nqMinusEs / 0.5) * 8))
-  const esBasis = implied.ES ?? Object.values(implied)[0]
-  const basis = esBasis?.anomaly ? (esBasis.carryPct > 0 ? 5 : -5) : 0
+  const leadBasis = (lead && implied[lead]) || implied.ES || Object.values(implied)[0]
+  const basis = leadBasis?.anomaly ? (leadBasis.carryPct > 0 ? 5 : -5) : 0
+  // The lead's own positioning when its COT report is there; else every report given.
+  const leadCots = lead ? allCots.filter(c => c.market === lead) : []
+  const cots = leadCots.length ? leadCots : allCots
   const cotScores = cots.map(c => (c.lev.index3y >= 90 ? -20 : c.lev.index3y <= 10 ? 20 : ((c.lev.index26w - 50) / 50) * 8))
   const positioning = cotScores.length ? cotScores.reduce((s, x) => s + x, 0) / cotScores.length : 0
   const score = clampScore(move + relative + basis + positioning)
@@ -947,7 +962,7 @@ export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[
       value: bi(`${pp(rtyMinusEs)} pp`, `${pp(rtyMinusEs)} 个百分点`),
       note: rtyMinusEs > 0.25 ? bi('small caps leading', '小盘股领涨') : rtyMinusEs < -0.25 ? bi('small caps lagging', '小盘股落后') : bi('in line', '步调一致'),
     })
-  for (const c of cots) {
+  for (const c of allCots) {
     const m = c.market ?? ''
     const ch = c.lev.change === undefined ? undefined : `${c.lev.change >= 0 ? '+' : ''}${c.lev.change}`
     readings.push({
@@ -987,12 +1002,13 @@ export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[
   else {
     const dir = avgMove > 0.15 ? 'higher' : avgMove < -0.15 ? 'lower' : 'flat'
     const dirZh = avgMove > 0.15 ? '上涨' : avgMove < -0.15 ? '下跌' : '持平'
-    const parts = [
-      es !== undefined ? `ES ${pct(changePct.ES ?? es)}` : undefined,
-      nq !== undefined ? `NQ ${pct(changePct.NQ ?? nq)}` : undefined,
-    ].filter((x): x is string => x !== undefined)
+    // The lead contract first, then ES and NQ for context.
+    const order: FuturesRoot[] = lead ? [lead, ...(['ES', 'NQ'] as FuturesRoot[]).filter(r => r !== lead)] : ['ES', 'NQ']
+    const parts = order.filter(r => movePct[r] !== undefined).map(r => `${r} ${pct(changePct[r] ?? movePct[r]!)}`)
     const moved = joinText(parts.length ? parts : [bi(`move ${pct(avgMove)}`, `变动 ${pct(avgMove)}`)], ', ', '，')
-    const imp = implied.ES ? bi(`, implying SPX ${pct(implied.ES.impliedChangePct)}`, `，对应 SPX ${pct(implied.ES.impliedChangePct)}`) : bi('', '')
+    const impRoot = lead && implied[lead] ? lead : 'ES'
+    const impOf = implied[impRoot]
+    const imp = impOf ? bi(`, implying ${impOf.index} ${pct(impOf.impliedChangePct)}`, `，对应 ${impOf.index} ${pct(impOf.impliedChangePct)}`) : bi('', '')
     const rs =
       nqMinusEs === undefined ? bi('', '') : nqMinusEs > 0.25 ? bi(', tech leading', '，科技股领涨') : nqMinusEs < -0.25 ? bi(', tech lagging', '，科技股落后') : bi('', '')
     const crowded = cots[0]?.lev.crowded
@@ -1013,6 +1029,7 @@ export function futuresModule(input: { quotes: FuturesQuote[]; cash?: CashQuote[
     flags,
     stats: {
       session,
+      lead,
       changePct,
       movePct,
       nqMinusEs,
