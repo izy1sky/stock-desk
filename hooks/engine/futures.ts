@@ -12,6 +12,7 @@
 // - CFTC Socrata, Traders in Financial Futures, futures only (gpe5-46if).
 
 import { addDays, marketToday, parseBars } from '../data'
+import { cboeJson } from './cboe'
 import { getJson, num, type Fetch } from './http'
 import { bi, biasText, joinText } from '../i18n'
 import { biasOf, clampScore, type Bar, type ModuleResult, type Reading, type Text } from './types'
@@ -135,7 +136,7 @@ export function sessionLabel(ms: number): FuturesSession {
   return 'after close'
 }
 
-function cashHours(ms: number): boolean {
+export function cashHours(ms: number): boolean {
   const { minutes, weekday } = etParts(ms)
 
   return weekday >= 1 && weekday <= 5 && minutes >= 570 && minutes < 960
@@ -171,14 +172,14 @@ const rnd = (n: number, digits = 2) => Math.round(n * 10 ** digits) / 10 ** digi
 // ---------------------------------------------------------------- futures quotes
 
 const CNBC = 'https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol'
-const cnbcUrl = (symbols: string[]) =>
+export const cnbcUrl = (symbols: string[]) =>
   `${CNBC}?symbols=${symbols.map(encodeURIComponent).join('%7C')}&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json`
 
 /** CNBC continuous front-month symbols. @TFS.1 is the CME Russell 2000 E-mini (RTY); @RTY.1 and @TF.1 return empty rows. */
 export const CNBC_FUTURES: Record<FuturesRoot, string> = { ES: '@SP.1', NQ: '@ND.1', YM: '@DJ.1', RTY: '@TFS.1' }
-const CNBC_CASH: Record<IndexSymbol, string> = { SPX: '.SPX', NDX: '.NDX', DJI: '.DJI', RUT: '.RUT' }
+export const CNBC_CASH: Record<IndexSymbol, string> = { SPX: '.SPX', NDX: '.NDX', DJI: '.DJI', RUT: '.RUT' }
 
-function cnbcRows(data: any): any[] {
+export function cnbcRows(data: any): any[] {
   const rows = data?.FormattedQuoteResult?.FormattedQuote
 
   return Array.isArray(rows) ? rows : rows ? [rows] : []
@@ -326,8 +327,6 @@ export function parseCnbcCash(data: any, now = Date.now()): CashQuote[] {
   return out
 }
 
-const cboeQuoteUrl = (s: IndexSymbol) => `https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/_${s}.json`
-
 /** CBOE delayed quote. `last_trade_time` is New York time without an offset; a quote more than 5 days old is dropped (CBOE's _DJI lags). */
 export function parseCboeCash(symbol: IndexSymbol, data: any, now = Date.now()): CashQuote | undefined {
   const d = data?.data
@@ -355,7 +354,7 @@ export async function loadCashIndexes(fetch: Fetch, symbols: IndexSymbol[] = IND
       .filter(s => !got.has(s))
       .map(async s => {
         try {
-          const q = parseCboeCash(s, await getJson(fetch, cboeQuoteUrl(s)), now)
+          const q = parseCboeCash(s, await cboeJson(fetch, `/quotes/_${s}.json`), now)
           if (q) got.set(s, q)
         } catch {
           // leave it out
@@ -372,9 +371,30 @@ export async function loadCashIndexes(fetch: Fetch, symbols: IndexSymbol[] = IND
 
 const NASDAQ = 'https://api.nasdaq.com/api/quote'
 
+const BARS_1D = 'https://ts-api.cnbc.com/harmony/app/bars'
+
+/** CNBC daily bars of a cash index, oldest first, without a session still under way. */
+async function cnbcIndexHistory(fetch: Fetch, symbol: IndexSymbol, days: number, now = Date.now()): Promise<Bar[]> {
+  const { date: today, minutes } = etParts(now)
+  const from = addDays(today, -Math.ceil(days * 1.5)).replace(/-/g, '')
+  const json = await getJson(fetch, `${BARS_1D}/${CNBC_CASH[symbol]}/1D/${from}000000/${today.replace(/-/g, '')}235900/adjusted/EST5EDT.json`)
+  const rows: any[] = Array.isArray(json?.barData?.priceBars) ? json.barData.priceBars : []
+  const bars: Bar[] = []
+  for (const r of rows) {
+    const m = /^(\d{4})(\d{2})(\d{2})/.exec(String(r.tradeTime ?? ''))
+    const c = num(r.close)
+    if (!m || c === undefined || c <= 0) continue
+    const t = `${m[1]}-${m[2]}-${m[3]}`
+    if (t === today && minutes < 16 * 60 + 15) continue
+    bars.push({ t, o: num(r.open) || c, h: num(r.high) || c, l: num(r.low) || c, c, v: 0 })
+  }
+
+  return bars.slice(-days)
+}
+
 /**
- * Daily cash index bars, oldest first: SPX and RUT from CBOE's history file,
- * NDX from Nasdaq. No free source for DJI history was found (Nasdaq does not
+ * Daily cash index bars, oldest first: SPX and RUT from CBOE's history file
+ * (CNBC's daily bars when CBOE does not answer), NDX from Nasdaq. No free source for DJI history was found (Nasdaq does not
  * know it, CBOE's file is stale), so DJI throws.
  */
 export async function loadIndexHistory(fetch: Fetch, symbol: IndexSymbol, days = 400): Promise<Bar[]> {
@@ -385,7 +405,14 @@ export async function loadIndexHistory(fetch: Fetch, symbol: IndexSymbol, days =
     return parseBars(json?.data).slice(-days)
   }
   if (symbol === 'DJI') throw new Error('No daily history source for DJI; use DIA bars instead')
-  const json = await getJson(fetch, `https://cdn-api.cboe.com/api/global/delayed_quotes/charts/historical/_${symbol}.json`)
+  let json: any
+  try {
+    json = await cboeJson(fetch, `/charts/historical/_${symbol}.json`)
+  } catch (e) {
+    const bars = await cnbcIndexHistory(fetch, symbol, days).catch(() => [] as Bar[])
+    if (bars.length) return bars
+    throw e
+  }
   const rows: any[] = Array.isArray(json?.data) ? json.data.slice(-days) : []
   const bars: Bar[] = []
   for (const r of rows) {

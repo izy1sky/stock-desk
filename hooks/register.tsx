@@ -12,7 +12,8 @@ import { levelRows, sessionsMarkdown, statRows } from './levels'
 import type { Row } from './levels'
 import { betaMarkdown, buildBetaMap, buildMarket, buildOptions, buildProbabilities, buildReport, indexAgreement, loadMarketContext, MARKET_INDEXES, marketMarkdown, moduleLabel, optionsReportMarkdown, probabilitiesMarkdown, reportMarkdown, scoreBar } from './engine/report'
 import type { MarketContext, Report } from './engine/report'
-import { skewReadText } from './engine/options'
+import type { OptionCache } from './engine/chains'
+import { skewReadText, sourceText } from './engine/options'
 import type { SkewRead } from './engine/options'
 import { fmtPrice, levelKindText } from './engine/technicals'
 import { agoText, biasText, dayLabel as dayLabelIn, etTime, LANGS, pick, relativeDays, tr } from './i18n'
@@ -220,6 +221,9 @@ async function refreshCalendar($: $, force = false): Promise<void> {
 // ticker: one load serves every report for a couple of minutes.
 let marketCache: MarketContext | undefined
 
+// Analysed option chains (large downloads), shared by every read for ten minutes.
+const chainCache: OptionCache = new Map()
+
 async function marketContext($: $): Promise<MarketContext> {
   if (marketCache && Date.now() - marketCache.fetchedAt < MARKET_TTL) return marketCache
   marketCache = await loadMarketContext(fetcher($))
@@ -257,6 +261,7 @@ async function refreshReport($: $, symbol: string, horizon: number, force = fals
       horizonDays: horizon,
       assetClass: known,
       market: await marketContext($),
+      optionCache: chainCache,
       earningsInDays: earnings ? tradingDaysTo(marketToday(), earnings.date) : undefined,
     })
     await update($, reports, all => ({ ...all, [symbol]: report }))
@@ -378,7 +383,7 @@ async function optionsContext($: $, symbol: string): Promise<OptionsContext | un
   const have = optionsCache.get(symbol)
   if (have && Date.now() - have.at < 10 * 60_000) return have.ctx
   try {
-    const { summary } = await buildOptions(fetcher($), symbol, marketCache?.vol)
+    const { summary } = await buildOptions(fetcher($), symbol, marketCache?.vol, chainCache)
     const m = summary.moves[0]
     const ctx: OptionsContext = {
       gammaFlip: summary.levels.gammaFlip,
@@ -810,14 +815,14 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'market_overview',
       description:
-        'The US market read: ES/NQ/YM/RTY futures with the cash index level they imply (pre-market too), the VIX / VIX9D / VIX3M / VVIX / SKEW term structure, CFTC COT positioning of leveraged funds, asset managers and dealers in ES and NQ, and a full analysis of both SPY (SPX) and QQQ (NDX) with a side-by-side comparison. Use for questions about the market as a whole, the pre-market, or as context before analysing a single stock.',
+        'The US market read: ES/NQ/YM/RTY futures with the cash index level they imply (pre-market too), the VIX / VIX9D / VIX3M / VVIX / SKEW term structure and VXN, CFTC COT positioning of leveraged funds, asset managers and dealers in ES and NQ, and a full analysis of both SPY (SPX) and QQQ (NDX) with a side-by-side comparison. Use for questions about the market as a whole, the pre-market, or as context before analysing a single stock.',
       inputSchema: { type: 'object', properties: { horizon_days: { type: 'integer', minimum: 1, maximum: 120, description: 'Horizon for the SPY and QQQ analyses (default 5)' } } },
       isDeferred: false,
     })
     await $.tool.register({
       name: 'options_positioning',
       description:
-        "One ticker's options market in detail, from CBOE's delayed chain with greeks: put/call by volume and open interest, ATM implied-vol term structure, 25-delta skew, dealer gamma exposure with the gamma flip, call and put walls, max pain per expiry, straddle-implied moves, largest open interest and unusual volume.",
+        "One ticker's options market in detail, from CBOE's delayed chain (Nasdaq's when CBOE does not answer, with vols and greeks computed; SPX is then scaled from SPY): put/call by volume and open interest, ATM implied-vol term structure, 25-delta skew, dealer gamma exposure with the gamma flip, call and put walls, max pain per expiry, straddle-implied moves, largest open interest and unusual volume.",
       inputSchema: { type: 'object', properties: { symbol: { type: 'string', description: 'US ticker or index, e.g. "SPY", "SPX", "NVDA"' } }, required: ['symbol'] },
       isDeferred: false,
     })
@@ -1022,7 +1027,7 @@ export const register: Register = on => {
   on('tool.call', { tool: /^mcp__stock-desk__market_overview$/ }, async ($, e) => {
     const horizon = Math.max(1, Math.min(120, Math.round(Number((e as unknown as { horizon_days?: number }).horizon_days ?? 5)) || 5))
     try {
-      const market = await buildMarket(fetcher($), horizon)
+      const market = await buildMarket(fetcher($), horizon, chainCache)
       marketCache = market.context
       await update($, reports, all => ({ ...all, ...(market.spy ? { SPY: market.spy } : {}), ...(market.qqq ? { QQQ: market.qqq } : {}) }))
 
@@ -1036,7 +1041,7 @@ export const register: Register = on => {
     const symbol = parseSymbols(String((e as unknown as { symbol?: string }).symbol ?? ''))[0]
     if (!symbol) return toolText('Give one US ticker as `symbol`.', true)
     try {
-      return toolText(optionsReportMarkdown(symbol, await buildOptions(fetcher($), symbol, marketCache?.vol)))
+      return toolText(optionsReportMarkdown(symbol, await buildOptions(fetcher($), symbol, marketCache?.vol, chainCache)))
     } catch (error) {
       return toolText(`No options data for ${symbol}: ${errorText(error)}`, true)
     }
@@ -1062,7 +1067,7 @@ export const register: Register = on => {
     const levels = raw.map(Number).filter(n => Number.isFinite(n) && n > 0)
     if (!symbol || !levels.length || !args.days) return toolText('Give `symbol`, `levels` (prices) and `days` (trading days).', true)
     try {
-      return toolText(probabilitiesMarkdown(await buildProbabilities(fetcher($), { symbol, levels, days: Number(args.days) })))
+      return toolText(probabilitiesMarkdown(await buildProbabilities(fetcher($), { symbol, levels, days: Number(args.days) }, chainCache)))
     } catch (error) {
       return toolText(`Probability failed: ${errorText(error)}`, true)
     }
@@ -1425,6 +1430,7 @@ export const register: Register = on => {
                 {L(', OI ', '，OI ')}
                 {o.pcOi?.toFixed(2) ?? '—'} · {L('ATM IV 30d', '平值 IV 30 日')} {o.ivAtm30 !== undefined ? `${(o.ivAtm30 * 100).toFixed(1)}%` : '—'} · {L('25Δ skew', '25Δ 偏斜')}{' '}
                 {o.skew ? L(`${(o.skew.skew * 100).toFixed(1)} pts (${pick('en', skewReadText(o.skew.read as SkewRead))})`, `${(o.skew.skew * 100).toFixed(1)} 个波动率点（${pick('zh', skewReadText(o.skew.read as SkewRead))}）`) : '—'} · {L('straddle to', '跨式组合至')} {o.moves[0]?.expiry ?? '—'} ±{o.moves[0]?.pct.toFixed(2) ?? '—'}%
+                {` · ${pick(lang, sourceText(o.source))}`}
               </Text>
             )}
             <Text weight="semibold">
@@ -1936,8 +1942,8 @@ export const register: Register = on => {
         </Box>
         <Text dimColor size="footnote">
           {L(
-            `Updated ${ago(data.fetchedAt, lang)} · data: Nasdaq, CBOE (options, VIX), CNBC (futures), CFTC (COT) · auto-refresh every 5 min. Analysis of market data, not investment advice.`,
-            `更新于${ago(data.fetchedAt, lang)} · 数据：Nasdaq、CBOE（期权、VIX）、CNBC（期货）、CFTC（COT）· 每 5 分钟自动刷新。基于市场数据的分析，不构成投资建议。`,
+            `Updated ${ago(data.fetchedAt, lang)} · data: Nasdaq, CBOE or Nasdaq (options), CBOE or CNBC (VIX), CNBC (futures), CFTC (COT) · auto-refresh every 5 min. Analysis of market data, not investment advice.`,
+            `更新于${ago(data.fetchedAt, lang)} · 数据：Nasdaq、CBOE 或 Nasdaq（期权）、CBOE 或 CNBC（VIX）、CNBC（期货）、CFTC（COT）· 每 5 分钟自动刷新。基于市场数据的分析，不构成投资建议。`,
           )}
         </Text>
       </Box>

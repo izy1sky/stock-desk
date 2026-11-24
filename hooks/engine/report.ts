@@ -23,8 +23,9 @@ import {
 } from './futures'
 import type { BetaStats, CashQuote, CotStats, FuturesQuote, FuturesRoot, ImpliedCash, IndexSymbol, Projection } from './futures'
 import type { Fetch } from './http'
-import { analyzeChain, fmtGex, loadChain, loadVolIndexes, optionsModule } from './options'
-import type { OptionsLevels, OptionsStats, SkewRead, VolIndexes } from './options'
+import { loadOptionStats, loadVol, type OptionCache } from './chains'
+import { fmtGex, optionsModule, sourceText } from './options'
+import type { ChainSource, OptionsLevels, OptionsStats, SkewRead, VolIndexes } from './options'
 import { fmtPrice, keyLevelsDetail, trendModule, volatilityModule, volumeModule } from './technicals'
 import type { LevelPoint } from './technicals'
 import { biasOf, clampScore } from './types'
@@ -116,6 +117,8 @@ export function composite(modules: ModuleResult[], days: number, indexLinked: bo
 
 export type OptionsSummary = {
   asOf: string
+  /** Where the chain came from (absent from summaries built before 0.6.0: CBOE). */
+  source?: ChainSource
   spot: number
   pcVolume?: number
   pcVolumeNear?: number
@@ -188,6 +191,7 @@ function slim(m: ModuleResult & { stats?: unknown; levels?: unknown }): ModuleRe
 function summarizeOptions(s: OptionsStats): OptionsSummary {
   return {
     asOf: s.asOf,
+    ...(s.source ? { source: s.source } : {}),
     spot: s.spot,
     pcVolume: s.pcVolume,
     pcVolumeNear: s.pcVolumeNear,
@@ -240,7 +244,7 @@ export async function loadMarketContext(fetch: Fetch): Promise<MarketContext> {
     loadCashIndexes(fetch).catch(e => (errors.push(`Cash indexes: ${message(e)}`), [] as CashQuote[])),
     loadCot(fetch, 'ES').then(rows => cotStats(rows, Date.now(), 'ES')).catch(e => (errors.push(`COT ES: ${message(e)}`), undefined)),
     loadCot(fetch, 'NQ').then(rows => cotStats(rows, Date.now(), 'NQ')).catch(e => (errors.push(`COT NQ: ${message(e)}`), undefined)),
-    loadVolIndexes(fetch).catch(e => (errors.push(`VIX indexes: ${message(e)}`), undefined)),
+    loadVol(fetch).catch(e => (errors.push(`VIX indexes: ${message(e)}`), undefined)),
   ])
 
   return { quotes, cash, cot: [cotEs, cotNq].filter((c): c is CotStats => !!c), vol, errors, fetchedAt: Date.now() }
@@ -255,6 +259,8 @@ export type ReportOptions = {
   bars?: Bar[]
   /** Trading days to the ticker's next earnings report, when known. */
   earningsInDays?: number
+  /** Option chains kept between reads. */
+  optionCache?: OptionCache
 }
 
 export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOptions = {}): Promise<Report> {
@@ -265,8 +271,7 @@ export async function buildReport(fetch: Fetch, symbol: string, opts: ReportOpti
 
   const [bars, chainStats, market] = await Promise.all([
     opts.bars?.length ? Promise.resolve(opts.bars) : loadBars(fetch, sym, opts.assetClass),
-    loadChain(fetch, sym)
-      .then(chain => analyzeChain(chain))
+    loadOptionStats(fetch, sym, { cache: opts.optionCache, assetClass: opts.assetClass })
       .catch(e => (errors.push(`Options chain: ${message(e)}`), undefined)),
     opts.market ? Promise.resolve(opts.market) : loadMarketContext(fetch),
   ])
@@ -403,7 +408,7 @@ function analogsMarkdown(a: AnalogStudy): string {
 function optionsMarkdown(o: OptionsSummary): string {
   const lv = o.levels
   const lines = [
-    `Options (CBOE delayed, as of ${o.asOf}, reference spot ${fmtPrice(o.spot)}):`,
+    `Options (${en(sourceText(o.source))}, as of ${o.asOf}, reference spot ${fmtPrice(o.spot)}):`,
     `- Put/call volume ${o.pcVolume?.toFixed(2) ?? '—'} (≤7 days ${o.pcVolumeNear?.toFixed(2) ?? '—'}), put/call OI ${o.pcOi?.toFixed(2) ?? '—'}`,
     `- ATM IV 30d ${o.ivAtm30 !== undefined ? pctOf(o.ivAtm30) : '—'}; term ${o.term.slice(0, 6).map(t => `${t.days}d ${pctOf(t.iv)}`).join(', ')}${o.termRatio !== undefined ? `; 9d/90d ratio ${o.termRatio.toFixed(2)}${o.termRatio > 1 ? ' (inverted)' : ''}` : ''}`,
     o.skew ? `- 25Δ skew (${o.skew.days}d): put ${pctOf(o.skew.put25)} vs call ${pctOf(o.skew.call25)} = ${(o.skew.skew * 100).toFixed(1)} vol pts (${o.skew.read})` : '- 25Δ skew: —',
@@ -415,6 +420,7 @@ function optionsMarkdown(o: OptionsSummary): string {
   ]
   if (o.unusual.length)
     lines.push(`- Unusual volume: ${o.unusual.map(u => `${u.expiry} ${fmtPrice(u.strike)}${u.type} vol ${u.volume.toLocaleString('en-US')} vs OI ${u.oi.toLocaleString('en-US')} (~$${(u.premium / 1e6).toFixed(2)}M)`).join('; ')}`)
+  if (o.source?.fallback) lines.push(`- CBOE did not answer (${o.source.fallback}), so this is Nasdaq's chain; put/call volume and open interest are its last published figures`)
   lines.push(`- ${en(o.gexNote)}`)
 
   return lines.join('\n')
@@ -448,11 +454,11 @@ export function reportMarkdown(r: Report): string {
 
 // ---------------------------------------------------------------- options alone
 
-export async function buildOptions(fetch: Fetch, symbol: string, vol?: VolIndexes): Promise<{ summary: OptionsSummary; module: ModuleResult }> {
+export async function buildOptions(fetch: Fetch, symbol: string, vol?: VolIndexes, optionCache?: OptionCache): Promise<{ summary: OptionsSummary; module: ModuleResult }> {
   const sym = symbol.toUpperCase()
   const [stats, v] = await Promise.all([
-    loadChain(fetch, sym).then(analyzeChain),
-    vol ? Promise.resolve(vol) : loadVolIndexes(fetch).catch(() => undefined),
+    loadOptionStats(fetch, sym, { cache: optionCache }),
+    vol ? Promise.resolve(vol) : loadVol(fetch).catch(() => undefined),
   ])
 
   return { summary: summarizeOptions(stats), module: slim(optionsModule(stats, v)) }
@@ -480,7 +486,7 @@ export const MARKET_INDEXES = [
   { symbol: 'QQQ', index: 'NDX' },
 ] as const
 
-export async function buildMarket(fetch: Fetch, horizonDays = 5): Promise<MarketReport> {
+export async function buildMarket(fetch: Fetch, horizonDays = 5, optionCache?: OptionCache): Promise<MarketReport> {
   const context = await loadMarketContext(fetch)
   const fm = context.quotes.length ? futuresModule({ quotes: context.quotes, cash: context.cash, cot: context.cot }) : undefined
   const implied: ImpliedCash[] = []
@@ -490,7 +496,7 @@ export async function buildMarket(fetch: Fetch, horizonDays = 5): Promise<Market
   }
   const [spy, qqq] = await Promise.all(
     MARKET_INDEXES.map(({ symbol }) =>
-      buildReport(fetch, symbol, { horizonDays, market: context, assetClass: 'etf' }).catch(e => {
+      buildReport(fetch, symbol, { horizonDays, market: context, assetClass: 'etf', optionCache }).catch(e => {
         context.errors.push(`${symbol} report: ${message(e)}`)
 
         return undefined
@@ -549,6 +555,18 @@ export function indexComparisonMarkdown(m: MarketReport): string {
     return h ? `${h.analogs.winRate.toFixed(0)}% vs ${h.baseline.winRate.toFixed(0)}%, mean ${sgn(h.analogs.mean)}% (n ${h.analogs.n})` : '—'
   }
   const near = (r: Report) => `${r.resistances[0] ? fmtPrice(r.resistances[0].price) : '—'} / ${r.supports[0] ? fmtPrice(r.supports[0].price) : '—'}`
+  const volIndex = (r: Report, v?: VolIndexes) => {
+    const [name, q] = r.symbol === 'QQQ' ? ['VXN', v?.vxn] : ['VIX', v?.vix]
+
+    return q ? `${name} ${q.value.toFixed(2)}${q.changePct !== undefined ? ` (${sgn(q.changePct, 1)}%)` : ''}` : '—'
+  }
+  const optionLevels = (r: Report) => {
+    const o = r.options
+    if (!o) return '—'
+    const lv = (x?: number) => (x !== undefined ? fmtPrice(x) : '—')
+
+    return `${o.ivAtm30 !== undefined ? pctOf(o.ivAtm30) : '—'} / ${lv(o.levels.gammaFlip)} / call ${lv(o.levels.callWall)}, put ${lv(o.levels.putWall)}`
+  }
   const move = (r: Report, i: number) => (r.moves[i] ? `±${r.moves[i]!.pct1.toFixed(2)}%` : '—')
   const rows: [string, string][] = [
     ['Close', col(r => `${fmtPrice(r.spot)} (${r.asOf})`)],
@@ -559,6 +577,8 @@ export function indexComparisonMarkdown(m: MarketReport): string {
     ['MA200', col(r => (r.key?.ma200 ? fmtPrice(r.key.ma200) : '—'))],
     ['ADX(14)', col(r => r.key?.adx?.toFixed(1) ?? '—')],
     ['RV20 (1y percentile)', col(r => (r.key?.rv20 !== undefined ? `${pctOf(r.key.rv20)} (${r.key.rvPct1y?.toFixed(0) ?? '—'})` : '—'))],
+    ['Volatility index', col(r => volIndex(r, m.context.vol))],
+    ['ATM IV 30d / gamma flip / walls', col(optionLevels)],
     ['Distribution / accumulation (25d)', col(r => (r.key ? `${r.key.distributionDays} / ${r.key.accumulationDays}` : '—'))],
     ['1σ 1 day / 1 week', col(r => `${move(r, 0)} / ${move(r, 1)}`)],
     ['Analogs 5 days: win vs baseline', col(analog5)],
@@ -581,7 +601,7 @@ export function marketMarkdown(m: MarketReport): string {
   })
   const v = ctx.vol
   const vix = v
-    ? `VIX ${v.vix?.value.toFixed(2) ?? '—'} · VIX9D ${v.vix9d?.value.toFixed(2) ?? '—'} · VIX3M ${v.vix3m?.value.toFixed(2) ?? '—'} · VVIX ${v.vvix?.value.toFixed(1) ?? '—'} · SKEW ${v.skew?.value.toFixed(1) ?? '—'}; VIX9D/VIX ${v.vix9dToVix?.toFixed(2) ?? '—'}, VIX/VIX3M ${v.vixToVix3m?.toFixed(2) ?? '—'} → ${v.regime ?? '—'}`
+    ? `VIX ${v.vix?.value.toFixed(2) ?? '—'} · VIX9D ${v.vix9d?.value.toFixed(2) ?? '—'} · VIX3M ${v.vix3m?.value.toFixed(2) ?? '—'} · VVIX ${v.vvix?.value.toFixed(1) ?? '—'} · SKEW ${v.skew?.value.toFixed(1) ?? '—'} · VXN ${v.vxn?.value.toFixed(2) ?? '—'}; VIX9D/VIX ${v.vix9dToVix?.toFixed(2) ?? '—'}, VIX/VIX3M ${v.vixToVix3m?.toFixed(2) ?? '—'} → ${v.regime ?? '—'}${v.source && v.source !== 'cboe' ? ` (${v.source === 'cnbc' ? 'CNBC' : 'CBOE and CNBC'})` : ''}`
     : 'VIX family: unavailable'
   const cot = ctx.cot.map(
     c =>
@@ -676,10 +696,11 @@ export type ProbabilityRow = { level: number; pctAway: number; above: number; be
 export async function buildProbabilities(
   fetch: Fetch,
   input: { symbol: string; levels: number[]; days: number },
+  optionCache?: OptionCache,
 ): Promise<{ symbol: string; spot: number; asOf: string; sigma: number; sigmaSource: string; days: number; rows: ProbabilityRow[] }> {
   const sym = input.symbol.toUpperCase()
   const days = Math.max(1, Math.min(252, Math.round(input.days)))
-  const [bars, chain] = await Promise.all([loadBars(fetch, sym), loadChain(fetch, sym).then(analyzeChain).catch(() => undefined)])
+  const [bars, chain] = await Promise.all([loadBars(fetch, sym), loadOptionStats(fetch, sym, { cache: optionCache }).catch(() => undefined)])
   const last = bars[bars.length - 1]!
   let sigma: number | undefined
   let sigmaSource = 'realized volatility (no option chain)'

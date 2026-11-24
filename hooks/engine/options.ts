@@ -27,7 +27,8 @@
 
 import { bi, biasText, joinText } from '../i18n'
 import { biasOf, clampScore, type ModuleResult, type Reading, type Text } from './types'
-import { getJson, num, type Fetch } from './http'
+import { cboeJson } from './cboe'
+import { num, type Fetch } from './http'
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -74,6 +75,40 @@ export type Chain = {
   /** CBOE's security type: 'stock' (also ETFs) or 'index'. */
   securityType?: string
   contracts: Contract[]
+  /** The underlying price the quotes reflect, when the loader knows it (otherwise put-call parity). */
+  quoteSpot?: number
+  source?: ChainSource
+}
+
+/** Where a chain came from. Absent on a chain built by hand. */
+export type ChainSource = {
+  provider: 'cboe' | 'nasdaq'
+  /** The chain of this fund stands in for the index's own, its prices times `ratio`. */
+  via?: { symbol: string; ratio: number }
+  /** The option quotes are the last session's closing ones. */
+  atClose?: boolean
+  /** No quotes were posted: vols come from the last session's trades. */
+  fromTrades?: boolean
+  /** Why CBOE was not used. */
+  fallback?: string
+}
+
+/** "Nasdaq, about 15 min delayed…": one short line on a chain's source. */
+export function sourceText(s: ChainSource | undefined): Text {
+  if (!s || s.provider === 'cboe') return bi('CBOE delayed', 'CBOE 延迟行情')
+  const [when, whenZh] = s.fromTrades
+    ? ['Nasdaq, no quotes posted: the last session\'s trades', 'Nasdaq 行情，暂无报价：用上一交易日的成交价']
+    : s.atClose
+      ? ['Nasdaq, quotes at the last close', 'Nasdaq 行情，为上一交易日收盘报价']
+      : ['Nasdaq, about 15 min delayed', 'Nasdaq 行情，约延迟 15 分钟']
+  const en = [when, 'IV and greeks computed here']
+  const zh = [whenZh, 'IV 与希腊值由本地计算']
+  if (s.via) {
+    en.unshift(`scaled from ${s.via.symbol} ×${s.via.ratio.toFixed(3)}`)
+    zh.unshift(`由 ${s.via.symbol} 换算 ×${s.via.ratio.toFixed(3)}`)
+  }
+
+  return bi(en.join('; '), zh.join('；'))
 }
 
 export type LoadChainOptions = {
@@ -202,9 +237,17 @@ export type OptionsStats = {
   topPutOi: StrikeOi[]
   unusual: UnusualContract[]
   assumptions: { r: number; q: number }
+  source?: ChainSource
 }
 
-export type VolQuote = { value: number; change?: number; changePct?: number; prevClose?: number }
+export type VolQuote = {
+  value: number
+  change?: number
+  changePct?: number
+  prevClose?: number
+  /** The session the value is from, 'YYYY-MM-DD', when the source says. */
+  date?: string
+}
 
 export type VolRegime = 'contango (calm)' | 'flat' | 'backwardation (stress)'
 
@@ -224,6 +267,10 @@ export type VolIndexes = {
   vix3m?: VolQuote
   vvix?: VolQuote
   skew?: VolQuote
+  /** The Nasdaq-100's VIX. */
+  vxn?: VolQuote
+  /** Where the values came from. */
+  source?: 'cboe' | 'cnbc' | 'cboe+cnbc'
   /** > 1: the coming week is priced as more volatile than the coming month. */
   vix9dToVix?: number
   /** > 1: backwardation, the classic stress signal. */
@@ -237,8 +284,6 @@ export type OptionsModuleResult = ModuleResult & { stats: OptionsStats; levels: 
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-const CBOE = 'https://cdn-api.cboe.com/api/global/delayed_quotes'
-
 /** Black-Scholes inputs for the gamma grid: a flat rate and dividend yield. */
 export const RISK_FREE = 0.04
 export const DIV_YIELD = 0.012
@@ -250,7 +295,7 @@ const MIN_T = 1 / (365 * 24) // one hour
 const INDEXES = new Set(['SPX', 'NDX', 'RUT', 'VIX', 'XSP', 'DJX'])
 
 /** Extra standard roots per underlying (weeklies / PM-settled series). */
-const EXTRA_ROOTS: Record<string, string[]> = {
+export const EXTRA_ROOTS: Record<string, string[]> = {
   SPX: ['SPXW'],
   NDX: ['NDXP'],
   RUT: ['RUTW'],
@@ -260,10 +305,13 @@ const EXTRA_ROOTS: Record<string, string[]> = {
 }
 
 /** AM-settled roots: they settle on the expiry morning's open. */
-const AM_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX', 'DJX'])
+export const AM_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX', 'DJX'])
 
 /** Underlyings whose options trade in CBOE's global (overnight) session. */
 const GTH = new Set(['SPX', 'XSP', 'VIX'])
+
+/** Whose volatility index is VXN. */
+const NDX_LINKED = new Set(['NDX', 'QQQ', 'QQQM', 'QLD', 'TQQQ', 'SQQQ', 'PSQ'])
 
 const GEX_NOTE = bi(
   'Dealer gamma uses the common public convention (SqueezeMetrics-style): dealers are assumed long the calls and short the puts customers trade, so call GEX = +Γ·OI·100·S²·1% and put GEX = −Γ·OI·100·S²·1%, in $ of delta change per 1% move. Positive totals mean dealer hedging tends to damp moves; negative totals mean it tends to amplify them. It is an estimate: real dealer positions are not public.',
@@ -448,7 +496,7 @@ export function parseChain(json: any, symbol: string, opts: LoadChainOptions = {
 
 /** Fetch and parse the CBOE delayed chain (≈5 MB for SPY, ≈14 MB for SPX). */
 export async function loadChain(fetch: Fetch, symbol: string, opts: LoadChainOptions = {}): Promise<Chain> {
-  const json = await getJson(fetch, `${CBOE}/options/${cboeSymbol(symbol)}.json`)
+  const json = await cboeJson(fetch, `/options/${cboeSymbol(symbol)}.json`)
 
   return parseChain(json, symbol, opts)
 }
@@ -808,7 +856,7 @@ export function analyzeChain(chain: Chain): OptionsStats {
   const expiries = groupExpiries(contracts)
   // Price-based reads (ATM IV, straddles, skew deltas) use the spot the quotes
   // were struck at; GEX, walls and bands use the most current spot.
-  const optionSpot = impliedSpot(contracts, chain.spot, chain.prevClose)
+  const optionSpot = chain.quoteSpot ?? impliedSpot(contracts, chain.spot, chain.prevClose)
   const spot = chain.securityType === 'index' && Math.abs(optionSpot / chain.spot - 1) > 0.002 ? optionSpot : chain.spot
 
   let callOi = 0
@@ -898,6 +946,7 @@ export function analyzeChain(chain: Chain): OptionsStats {
     topPutOi: topOi(contracts, 'P'),
     unusual: unusualOf(contracts, callVolume + putVolume),
     assumptions: { r: RISK_FREE, q: DIV_YIELD },
+    ...(chain.source ? { source: chain.source } : {}),
   }
 }
 
@@ -908,7 +957,7 @@ function opt<K extends string>(key: K, value: number | undefined): { [P in K]?: 
 // ─── Volatility indexes ───────────────────────────────────────────────────
 
 async function volQuote(fetch: Fetch, sym: string): Promise<VolQuote | undefined> {
-  const json = await getJson(fetch, `${CBOE}/quotes/${sym}.json`)
+  const json = await cboeJson(fetch, `/quotes/${sym}.json`)
   const d = json?.data
   const value = n0(d?.current_price)
   if (!(value > 0)) return undefined
@@ -930,25 +979,41 @@ export function volRegime(vixToVix3m: number): VolRegime {
   return 'flat'
 }
 
-/** VIX, VIX9D, VIX3M, VVIX and SKEW from CBOE; any one may be missing. */
-export async function loadVolIndexes(fetch: Fetch): Promise<VolIndexes> {
-  const syms = ['_VIX', '_VIX9D', '_VIX3M', '_VVIX', '_SKEW'] as const
-  const got = await Promise.all(syms.map(s => volQuote(fetch, s).catch(() => undefined)))
-  const [vix, vix9d, vix3m, vvix, skew] = got
-  if (!got.some(Boolean)) throw new Error('CBOE volatility indexes unavailable')
-  const vix9dToVix = vix && vix9d ? vix9d.value / vix.value : undefined
-  const vixToVix3m = vix && vix3m ? vix.value / vix3m.value : undefined
+export type VolKey = 'vix' | 'vix9d' | 'vix3m' | 'vvix' | 'skew' | 'vxn'
+export const VOL_KEYS: VolKey[] = ['vix', 'vix9d', 'vix3m', 'vvix', 'skew', 'vxn']
+export type VolParts = Partial<Record<VolKey, VolQuote>>
+
+/**
+ * The family with its term-structure ratios. VIX is quoted from 03:00 ET while
+ * VIX9D and VIX3M still show the prior close: a ratio then uses VIX's own
+ * prior close, so both sides are from the same session.
+ */
+export function volFamily(parts: VolParts): VolIndexes {
+  const { vix, vix9d, vix3m } = parts
+  const vixFor = (other: VolQuote) => (vix!.date && other.date && vix!.date > other.date && vix!.prevClose ? vix!.prevClose : vix!.value)
+  const vix9dToVix = vix && vix9d ? vix9d.value / vixFor(vix9d) : undefined
+  const vixToVix3m = vix && vix3m ? vixFor(vix3m) / vix3m.value : undefined
+  const out: VolIndexes = {}
+  for (const k of VOL_KEYS) if (parts[k]) out[k] = parts[k]
 
   return {
-    ...(vix ? { vix } : {}),
-    ...(vix9d ? { vix9d } : {}),
-    ...(vix3m ? { vix3m } : {}),
-    ...(vvix ? { vvix } : {}),
-    ...(skew ? { skew } : {}),
+    ...out,
     ...opt('vix9dToVix', vix9dToVix),
     ...opt('vixToVix3m', vixToVix3m),
     ...(vixToVix3m !== undefined ? { regime: volRegime(vixToVix3m) } : {}),
   }
+}
+
+/** VIX, VIX9D, VIX3M, VVIX, SKEW and VXN from CBOE; any one may be missing. */
+export async function loadVolIndexes(fetch: Fetch): Promise<VolIndexes> {
+  const got = await Promise.all(VOL_KEYS.map(k => volQuote(fetch, `_${k.toUpperCase()}`).catch(() => undefined)))
+  if (!got.some(Boolean)) throw new Error('CBOE volatility indexes unavailable')
+  const parts: VolParts = {}
+  VOL_KEYS.forEach((k, i) => {
+    if (got[i]) parts[k] = got[i]
+  })
+
+  return volFamily(parts)
 }
 
 // ─── Module ───────────────────────────────────────────────────────────────
@@ -1091,6 +1156,10 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
 
   let confidence = stats.totalOi >= 1e6 ? 0.65 : stats.totalOi >= 2e5 ? 0.55 : stats.totalOi >= 5e4 ? 0.4 : 0.25
   if (stats.ivAtm30 === undefined || gex.flip === undefined) confidence -= 0.1
+  if (stats.source?.fromTrades) {
+    confidence -= 0.25
+    flags.push(bi('No option quotes are posted yet: vols and gamma come from the last session\'s trades and are rough.', '期权尚未挂出报价：波动率与伽马由上一交易日的成交价推算，较为粗略。'))
+  }
   if (stats.totalOi < 5e4)
     flags.push(
       bi(
@@ -1178,6 +1247,7 @@ export function optionsModule(stats: OptionsStats, vol?: VolIndexes): OptionsMod
       value: `±${move.pct.toFixed(1)}%`,
       note: bi(`${price(move.lo)}–${price(move.hi)}`, `区间 ${price(move.lo)}–${price(move.hi)}`),
     })
+  if (vol?.vxn && NDX_LINKED.has(stats.symbol)) readings.push({ name: bi('VXN', 'VXN 纳指波动率指数'), value: Number(vol.vxn.value.toFixed(2)) })
   if (vol?.vix) readings.push({ name: bi('VIX', 'VIX 恐慌指数'), value: Number(vol.vix.value.toFixed(2)), ...(vol.regime ? { note: volRegimeText(vol.regime) } : {}) })
 
   return { key: 'options', score: final, confidence: Math.max(0.1, confidence), verdict, readings: readings.map(clean), flags, stats, levels }

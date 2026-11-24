@@ -34,7 +34,7 @@ The tools also put the result in the stock-desk pane (Analysis tab), so the pers
    - Expected moves and scenario probabilities come from a zero-drift lognormal model on implied (or realized) vol: they describe the size of moves the market prices, not direction.
    - Direction comes from the module scores and the analog study. Quote the analog sample size and compare its win rate with the baseline; with n < 20, or a win rate within ~5 points of the baseline, call the edge weak.
    - Never present a model probability as a prediction of what will happen.
-5. **Check freshness.** Quotes are ~15 minutes delayed; options and vol indexes are CBOE delayed; COT is as of the prior Tuesday. If a source failed, the tool says so — say it too, and do not fill the gap with guesses.
+5. **Check freshness.** Quotes are ~15 minutes delayed; COT is as of the prior Tuesday. The options line names its source: CBOE, or Nasdaq with vols and greeks computed (say so when it is Nasdaq; before the open its put/call volume is the last session's and the 0-day vol is inflated by wide quotes). "Scaled from SPY" SPX levels are SPY's positioning in SPX points, not SPX options: quote them as approximate. "No quotes posted" means rough numbers: do not lean on them. Pre-market, VIX is live while VIX9D, VIX3M and VXN are the prior close. If a source failed, the tool says so — say it too, and do not fill the gap with guesses.
 
 ## Reading the intraday tool
 

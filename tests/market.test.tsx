@@ -175,7 +175,8 @@ test('the market strip shows SPY and QQQ above Analysis and Intraday, hides, and
 
   await ui.press({ key: 'tab-intraday' })
   expect(await ui.find({ type: 'Text', text: /· today · SPY for SPX/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /VWAP [+-]\d/ })).toBeDefined()
+  // Price and change are there at any hour (VWAP only once the session is open).
+  expect(await ui.find({ type: 'Text', text: /^\d+\.\d\d [+-]\d+\.\d\d%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /(stronger index today|move together)/ })).toBeDefined()
 
   // Opening QQQ from the strip selects it; TSLA stays where it was.

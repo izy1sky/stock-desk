@@ -9,7 +9,7 @@ For any US stock, ETF or index (SPX, NDX, RUT), the engine scores five modules f
 - **Trend**: the 5/10/20/50/200-day moving-average stack and slopes, ADX, swing structure (higher highs / lower lows), weekly confirmation, place in the 52-week range.
 - **Volatility**: realized vol (10/20/60 days) and its percentile, ATR, Bollinger squeeze, implied vs realized.
 - **Volume and flow**: OBV and its divergence from price, up/down volume, distribution and accumulation days.
-- **Options** (CBOE delayed chain with greeks): put/call by volume and open interest, ATM term structure, 25-delta skew, dealer gamma and the gamma flip, call and put walls, max pain, straddle-implied moves, unusual volume; VIX / VIX9D / VIX3M / VVIX / SKEW.
+- **Options** (CBOE's delayed chain, or Nasdaq's with vols and greeks solved from its quotes when CBOE does not answer): put/call by volume and open interest, ATM term structure, 25-delta skew, dealer gamma and the gamma flip, call and put walls, max pain, straddle-implied moves, unusual volume; VIX / VIX9D / VIX3M / VVIX / SKEW and VXN.
 - **Futures**: ES, NQ, YM and RTY with the cash level they imply (pre-market too), and CFTC COT positioning of leveraged funds, asset managers and dealers.
 
 On top: key levels (swing points, averages, option walls), expected moves, bull/base/bear scenarios with lognormal odds, and a historical-analog study (the 40 past days most like today in ten years of prices, and what followed).
@@ -24,7 +24,9 @@ Claude gets the tools `analyze_ticker`, `market_overview`, `options_positioning`
 
 **Languages**: English and 简体中文 — the Language button in the pane's footer switches every pane, the analysis included; the tools answer Claude in English either way.
 
-Data: Nasdaq (prices, ~15 min delayed), CBOE (options, VIX), CNBC (futures, cash indexes), CFTC (COT). No keys. This is analysis of market data, not investment advice.
+**Option sources**: CBOE is asked first. If it refuses (a Cloudflare block or a rate limit), it is left alone for six hours and Nasdaq's chain is used; every options read says which one it is. Nasdaq has no SPX or RUT options, so those are SPY's and IWM's levels scaled to the index and marked so; NDX has its own chain, which stays at the last close before the open. Before the open, names with no posted quotes use the last session's trades, flagged and trusted less. Chains are kept ten minutes.
+
+Data: Nasdaq (prices and options, ~15 min delayed), CBOE (options, VIX), CNBC (futures, cash indexes, VIX when CBOE does not answer), CFTC (COT). No keys. This is analysis of market data, not investment advice.
 
 ## Pane
 
